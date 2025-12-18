@@ -183,7 +183,7 @@ class BatchRecall(Star):
     @filter.command("批量撤回")
     async def batch_recall_command(self, event: AstrMessageEvent):
         """
-        批量撤回最近的消息:批量撤回 @用户 撤回数量 (导致撤回指定用户消息)
+        批量撤回最近的消息:批量撤回 @用户 撤回数量 (撤回指定用户消息)
         批量撤回最近的消息:批量撤回 撤回数量 (倒序撤回消息)
         """
         if not isinstance(event, AiocqhttpMessageEvent):
