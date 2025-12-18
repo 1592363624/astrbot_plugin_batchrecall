@@ -1,0 +1,32 @@
+{
+    "recall_time": {
+        "description": "撤回时间",
+        "type": "int", 
+        "hint": "自动撤回消息的间隔时间，单位为秒",
+        "default": 10
+    },
+    "enable_private_recall": {
+        "description": "启用私聊撤回",
+        "type": "bool",
+        "hint": "是否在私聊中启用撤回功能",
+        "default": true
+    },
+    "enable_group_recall": {
+        "description": "启用群聊撤回", 
+        "type": "bool",
+        "hint": "是否在群聊中启用撤回功能",
+        "default": true
+    },
+    "group_whitelist": {
+        "description": "白名单群聊",
+        "type": "list",
+        "hint": "只有在此列表中的群聊才能使用撤回功能，留空表示所有群聊都可用",
+        "default": []
+    },
+    "batch_max_count": {
+        "description": "批量撤回最大条数",
+        "type": "int",
+        "hint": "批量撤回指令单次最多可撤回的消息数量",
+        "default": 20
+    }
+}
