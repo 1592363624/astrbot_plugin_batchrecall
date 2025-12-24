@@ -17,7 +17,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     "astrbot_plugin_batchrecall",
     "Shell",
     "批量撤回,指定撤回,自动撤回,防撤回,撤回,撤回,撤回",
-    "1.0.0",
+    "1.0.1",
     "https://github.com/1592363624/astrbot_plugin_batchrecall",
 )
 class BatchRecall(Star):
@@ -54,6 +54,10 @@ class BatchRecall(Star):
     def _should_enable_recall(self, event: AstrMessageEvent) -> bool:
         """判断是否应该启用撤回"""
         if not event.get_group_id():
+            # 私聊场景
+            if event.is_admin():
+                # 如果是管理员，检查是否允许撤回管理员私聊
+                return self.conf.get("enable_admin_private_recall", False)
             return self.conf.get("enable_private_recall", True)
 
         group_id = event.get_group_id()

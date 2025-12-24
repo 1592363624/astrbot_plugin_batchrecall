@@ -11,6 +11,12 @@
         "hint": "是否在私聊中启用撤回功能",
         "default": true
     },
+    "enable_admin_private_recall": {
+        "description": "是否撤回管理员私聊",
+        "type": "bool",
+        "hint": "是否撤回与管理员的私聊消息，启用时管理员的私聊也会被撤回",
+        "default": false
+    },
     "enable_group_recall": {
         "description": "启用群聊撤回", 
         "type": "bool",
