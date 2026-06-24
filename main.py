@@ -17,7 +17,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     "astrbot_plugin_batchrecall",
     "Shell",
     "批量撤回,指定撤回,自动撤回,防撤回,撤回,撤回,撤回,撤回自身",
-    "1.0.2",
+    "1.0.3",
     "https://github.com/1592363624/astrbot_plugin_batchrecall",
 )
 class BatchRecall(Star):
@@ -264,6 +264,8 @@ class BatchRecall(Star):
                 logger.error(f"撤回机器人消息失败, message_id={message_id}: {exc}")
 
         yield event.plain_result(f"已尝试撤回机器人最近 {success} 条消息。")
+        # 阻止后续 handler 和 LLM 处理
+        event.stop_event()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("批量撤回")
@@ -358,3 +360,5 @@ class BatchRecall(Star):
             yield event.plain_result(f"已尝试撤回 {success} 条该用户的最近消息。")
         else:
             yield event.plain_result(f"已尝试撤回最近 {success} 条群消息。")
+        # 阻止后续 handler 和 LLM 处理
+        event.stop_event()
