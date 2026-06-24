@@ -17,7 +17,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     "astrbot_plugin_batchrecall",
     "Shell",
     "批量撤回,指定撤回,自动撤回,防撤回,撤回,撤回,撤回,撤回自身",
-    "1.0.3",
+    "1.0.4",
     "https://github.com/1592363624/astrbot_plugin_batchrecall",
 )
 class BatchRecall(Star):
@@ -248,18 +248,26 @@ class BatchRecall(Star):
             yield event.plain_result("未找到可撤回的机器人消息。")
             return
 
-        # 按时间倒序排列，取最近的 N 条
+        # 按时间倒序排列
         bot_messages.sort(key=lambda item: item.get("time", 0), reverse=True)
-        to_recall = bot_messages[:count]
 
+        # 持续尝试撤回，直到成功撤回指定数量或没有更多消息
         success = 0
-        for msg in to_recall:
+        for msg in bot_messages:
+            if success >= count:
+                break
             message_id = msg.get("message_id")
             if not message_id:
                 continue
             try:
                 await event.bot.delete_msg(message_id=message_id)
                 success += 1
+            except ActionFailed as e:
+                # retcode 1200 表示消息已撤回或超时，继续尝试下一条
+                if getattr(e, "retcode", None) == 1200:
+                    logger.info(f"消息 {message_id} 已撤回或超时，跳过")
+                    continue
+                logger.error(f"撤回机器人消息失败, message_id={message_id}: {e}")
             except Exception as exc:
                 logger.error(f"撤回机器人消息失败, message_id={message_id}: {exc}")
 
@@ -343,16 +351,24 @@ class BatchRecall(Star):
             return
 
         filtered_messages.sort(key=lambda item: item.get("time", 0), reverse=True)
-        to_recall = filtered_messages[:count]
 
+        # 持续尝试撤回，直到成功撤回指定数量或没有更多消息
         success = 0
-        for msg in to_recall:
+        for msg in filtered_messages:
+            if success >= count:
+                break
             message_id = msg.get("message_id")
             if not message_id:
                 continue
             try:
                 await event.bot.delete_msg(message_id=message_id)
                 success += 1
+            except ActionFailed as e:
+                # retcode 1200 表示消息已撤回或超时，继续尝试下一条
+                if getattr(e, "retcode", None) == 1200:
+                    logger.info(f"消息 {message_id} 已撤回或超时，跳过")
+                    continue
+                logger.error(f"批量撤回消息失败, message_id={message_id}: {e}")
             except Exception as exc:
                 logger.error(f"批量撤回消息失败, message_id={message_id}: {exc}")
 
