@@ -34,5 +34,11 @@
         "type": "int",
         "hint": "批量撤回指令单次最多可撤回的消息数量",
         "default": 20
+    },
+    "enable_recall_notification": {
+        "description": "撤回结果通知",
+        "type": "bool",
+        "hint": "是否在撤回完成后返回结果通知消息",
+        "default": true
     }
 }

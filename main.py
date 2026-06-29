@@ -167,6 +167,7 @@ class BatchRecall(Star):
         config_info += f"撤回时间: {self.conf['recall_time']}秒\n"
         config_info += f"私聊启用: {self.conf.get('enable_private_recall', True)}\n"
         config_info += f"群聊启用: {self.conf.get('enable_group_recall', True)}\n"
+        config_info += f"撤回结果通知: {self.conf.get('enable_recall_notification', True)}\n"
         group_whitelist = self.conf.get("group_whitelist", [])
         if group_whitelist:
             config_info += f"白名单群: {len(group_whitelist)}个\n"
@@ -245,7 +246,8 @@ class BatchRecall(Star):
         ]
 
         if not bot_messages:
-            yield event.plain_result("未找到可撤回的机器人消息。")
+            if self.conf.get("enable_recall_notification", True):
+                yield event.plain_result("未找到可撤回的机器人消息。")
             return
 
         # 按时间倒序排列
@@ -271,7 +273,9 @@ class BatchRecall(Star):
             except Exception as exc:
                 logger.error(f"撤回机器人消息失败, message_id={message_id}: {exc}")
 
-        yield event.plain_result(f"已尝试撤回机器人最近 {success} 条消息。")
+        # 根据配置决定是否返回撤回结果通知
+        if self.conf.get("enable_recall_notification", True):
+            yield event.plain_result(f"已尝试撤回机器人最近 {success} 条消息。")
         # 阻止后续 handler 和 LLM 处理
         event.stop_event()
 
@@ -344,10 +348,11 @@ class BatchRecall(Star):
             filtered_messages = history_messages
 
         if not filtered_messages:
-            if target_qq:
-                yield event.plain_result("未找到可撤回的目标用户消息。")
-            else:
-                yield event.plain_result("未找到可撤回的机器人消息。")
+            if self.conf.get("enable_recall_notification", True):
+                if target_qq:
+                    yield event.plain_result("未找到可撤回的目标用户消息。")
+                else:
+                    yield event.plain_result("未找到可撤回的机器人消息。")
             return
 
         filtered_messages.sort(key=lambda item: item.get("time", 0), reverse=True)
@@ -372,9 +377,11 @@ class BatchRecall(Star):
             except Exception as exc:
                 logger.error(f"批量撤回消息失败, message_id={message_id}: {exc}")
 
-        if target_qq:
-            yield event.plain_result(f"已尝试撤回 {success} 条该用户的最近消息。")
-        else:
-            yield event.plain_result(f"已尝试撤回最近 {success} 条群消息。")
+        # 根据配置决定是否返回撤回结果通知
+        if self.conf.get("enable_recall_notification", True):
+            if target_qq:
+                yield event.plain_result(f"已尝试撤回 {success} 条该用户的最近消息。")
+            else:
+                yield event.plain_result(f"已尝试撤回最近 {success} 条群消息。")
         # 阻止后续 handler 和 LLM 处理
         event.stop_event()
