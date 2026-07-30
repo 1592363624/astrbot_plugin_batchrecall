@@ -1,7 +1,7 @@
 {
     "recall_time": {
         "description": "撤回时间",
-        "type": "int", 
+        "type": "int",
         "hint": "自动撤回消息的间隔时间，单位为秒",
         "default": 10
     },
@@ -18,7 +18,7 @@
         "default": false
     },
     "enable_group_recall": {
-        "description": "启用群聊撤回", 
+        "description": "启用群聊撤回",
         "type": "bool",
         "hint": "是否在群聊中启用撤回功能",
         "default": true
@@ -40,5 +40,11 @@
         "type": "bool",
         "hint": "是否在撤回完成后返回结果通知消息",
         "default": true
+    },
+    "max_message_history": {
+        "description": "消息记录最大条数",
+        "type": "int",
+        "hint": "每个会话最多记录多少条机器人消息用于编号撤回",
+        "default": 50
     }
 }
