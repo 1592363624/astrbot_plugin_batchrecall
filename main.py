@@ -649,6 +649,7 @@ class BatchRecall(Star):
             if self.conf.get("enable_recall_notification", True):
                 self._mark_no_auto_recall()
                 yield event.plain_result("未找到可撤回的机器人消息。")
+            event.stop_event()
             return
 
         success = 0
@@ -842,6 +843,7 @@ class BatchRecall(Star):
                 if self.conf.get("enable_recall_notification", True):
                     self._mark_no_auto_recall()
                     yield event.plain_result("未找到可撤回的消息。")
+                event.stop_event()
                 return
 
             success = 0
@@ -921,6 +923,7 @@ class BatchRecall(Star):
                 if self.conf.get("enable_recall_notification", True):
                     self._mark_no_auto_recall()
                     yield event.plain_result("没有可撤回的消息记录，请先发送「消息列表」查看。")
+                event.stop_event()
                 return
 
             success = 0
