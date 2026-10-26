@@ -273,8 +273,8 @@ class BatchRecall(Star):
                 if not message_id:
                     continue
                 msg_time = int(message.get("time", 0) or 0)
-                # OneBot 时间戳只有秒级精度，扩大窗口后再按本次消息内容过滤。
-                if msg_time < int(sent_at) - 5:
+                # OneBot 时间戳只有秒级精度，保留发送前10秒的机器人消息。
+                if msg_time < int(sent_at) - 10:
                     continue
                 recent_bot_ids.append(int(message_id))
                 bot_messages.append((msg_time, int(message_id), message))
@@ -306,7 +306,7 @@ class BatchRecall(Star):
                 for _, message_id, _ in sorted(bot_messages, key=lambda item: (item[0], item[1]))
             ]
             logger.info(
-                f"📥 群历史近5秒机器人消息ID: {recent_bot_ids}；"
+                f"📥 群历史近10秒机器人消息ID: {recent_bot_ids}；"
                 f"按发送顺序入队: {captured_ids}；"
                 f"新增入队 {added_count} 条"
             )
