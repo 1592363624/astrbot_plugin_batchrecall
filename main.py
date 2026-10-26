@@ -259,7 +259,7 @@ class BatchRecall(Star):
             result = await event.bot.call_action(
                 "get_group_msg_history",
                 group_id=int(session_id),
-                count=20,
+                count=100,
             )
             messages = result.get("messages", []) if isinstance(result, dict) else []
             bot_messages = []
@@ -503,13 +503,9 @@ class BatchRecall(Star):
             if not is_command_reply and self._should_enable_recall(event):
                 recall_time = self.conf["recall_time"]
                 logger.info(f"🎯 拦截到机器人消息，{recall_time}秒后撤回")
-                # 图片链在部分协议端可能拆成多条实际消息；先从历史补齐所有ID，
+                # 一次发送可能被协议端拆成多个实际消息；每次群发送后都从历史补齐ID，
                 # 再把发送接口返回的ID作为兜底加入FIFO队列。
-                has_image = any(
-                    isinstance(segment, dict) and segment.get("type") == "image"
-                    for segment in onebot_messages
-                )
-                if is_group and has_image:
+                if is_group:
                     await self._queue_recent_bot_messages(
                         event,
                         session_id,
