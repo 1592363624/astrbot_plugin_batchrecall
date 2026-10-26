@@ -30,6 +30,9 @@ class BatchRecall(Star):
         super().__init__(context)
         self.conf = config
         self.recall_tasks = set()
+        # 同一会话的撤回请求串行执行，避免短时间并发调用被协议端丢弃。
+        self._recall_locks: dict[str, asyncio.Lock] = {}
+        self._last_recall_at: dict[str, float] = {}
         # 消息历史记录：{session_id: [(message_id, content_preview, timestamp, sender_id, sender_name, is_bot), ...]}
         # 最新消息在列表最前面，编号从1开始
         self.message_history: dict[str, list[tuple[int, str, int, str, str, bool]]] = {}
@@ -171,23 +174,20 @@ class BatchRecall(Star):
         logger.info(f"⏰ 等待 {recall_time} 秒后撤回消息 {message_id}")
 
         await asyncio.sleep(recall_time)
-        try:
-            if message_id and message_id != 0:
-                await client.delete_msg(message_id=message_id)
-                logger.info(f"✅ 已自动撤回消息: {message_id}")
-                if session_id:
-                    self._remove_message_from_history(session_id, message_id)
-        except ActionFailed as e:
-            if getattr(e, "retcode", None) == 1200:
-                logger.info(
-                    f"撤回消息可能已超时或被撤回，message_id={message_id}, retcode={e.retcode}",
-                )
-                if session_id:
-                    self._remove_message_from_history(session_id, message_id)
-                return
-            logger.error(f"撤回消息失败: {e}")
-        except Exception as e:
-            logger.error(f"撤回消息失败: {e}")
+        if not message_id:
+            return
+
+        ok, err = await self._do_recall(client, message_id, session_id)
+        if ok:
+            logger.info(f"✅ 已自动撤回消息: {message_id}")
+            if session_id:
+                self._remove_message_from_history(session_id, message_id)
+        elif "已撤回" in err:
+            logger.info(f"撤回消息可能已超时或被撤回，message_id={message_id}: {err}")
+            if session_id:
+                self._remove_message_from_history(session_id, message_id)
+        else:
+            logger.error(f"撤回消息失败，message_id={message_id}: {err}")
 
     def _should_enable_recall(self, event: AstrMessageEvent) -> bool:
         """判断是否应该启用自动撤回"""
@@ -249,7 +249,7 @@ class BatchRecall(Star):
                     yield event.plain_result("撤回命令仅管理员可使用。")
                     return
                 session_id = self._get_session_id(event)
-                ok, err = await self._do_recall(event.bot, reply_id)
+                ok, err = await self._do_recall(event.bot, reply_id, session_id)
                 self._remove_message_from_history(session_id, reply_id)
                 if self.conf.get("enable_recall_notification", True):
                     self._mark_no_auto_recall()
@@ -372,17 +372,46 @@ class BatchRecall(Star):
         except Exception as e:
             logger.error(f"消息拦截处理失败: {e}")
 
-    async def _do_recall(self, bot, message_id: int) -> tuple[bool, str]:
-        """执行撤回操作，返回(是否成功, 错误信息)"""
-        try:
-            await bot.delete_msg(message_id=message_id)
-            return True, ""
-        except ActionFailed as e:
-            if getattr(e, "retcode", None) == 1200:
-                return False, "消息已撤回或超时"
-            return False, f"撤回失败(retcode={e.retcode})"
-        except Exception as e:
-            return False, f"撤回失败: {str(e)}"
+    async def _do_recall(
+        self,
+        bot,
+        message_id: int,
+        session_id: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """串行执行并短暂重试撤回，返回(是否成功，错误信息)。"""
+        if not message_id:
+            return False, "无效的消息ID"
+
+        lock_key = str(session_id) if session_id is not None else "__default__"
+        lock = self._recall_locks.setdefault(lock_key, asyncio.Lock())
+
+        async with lock:
+            # 每个会话的删除请求间隔少量时间，避免协议端在密集请求时漏处理。
+            for attempt in range(3):
+                elapsed = time.monotonic() - self._last_recall_at.get(lock_key, 0.0)
+                if elapsed < 0.2:
+                    await asyncio.sleep(0.2 - elapsed)
+                self._last_recall_at[lock_key] = time.monotonic()
+
+                try:
+                    await bot.delete_msg(message_id=int(message_id))
+                    return True, ""
+                except ActionFailed as e:
+                    if getattr(e, "retcode", None) == 1200:
+                        return False, "消息已撤回或超时"
+                    error = f"撤回失败(retcode={getattr(e, 'retcode', '未知')})"
+                except Exception as e:
+                    error = f"撤回失败: {str(e)}"
+
+                if attempt < 2:
+                    delay = 0.3 * (attempt + 1)
+                    logger.warning(
+                        f"撤回消息 {message_id} 失败，{delay:.1f} 秒后重试 "
+                        f"({attempt + 1}/2): {error}"
+                    )
+                    await asyncio.sleep(delay)
+
+            return False, error
 
     @filter.command("test_recall")
     async def test_recall_command(self, event: AstrMessageEvent):
@@ -660,7 +689,7 @@ class BatchRecall(Star):
             message_id = msg[0]
             if not message_id:
                 continue
-            ok, err = await self._do_recall(event.bot, message_id)
+            ok, err = await self._do_recall(event.bot, message_id, session_id)
             if ok:
                 success += 1
                 self._remove_message_from_history(session_id, message_id)
@@ -756,7 +785,7 @@ class BatchRecall(Star):
 
         # 有引用消息时优先处理引用撤回
         if reply_id:
-            ok, err = await self._do_recall(event.bot, reply_id)
+            ok, err = await self._do_recall(event.bot, reply_id, session_id)
             self._remove_message_from_history(session_id, reply_id)
             if self.conf.get("enable_recall_notification", True):
                 self._mark_no_auto_recall()
@@ -854,7 +883,7 @@ class BatchRecall(Star):
                 message_id = msg[0]
                 if not message_id:
                     continue
-                ok, err = await self._do_recall(event.bot, message_id)
+                ok, err = await self._do_recall(event.bot, message_id, session_id)
                 if ok:
                     success += 1
                     self._remove_message_from_history(session_id, message_id)
@@ -895,7 +924,7 @@ class BatchRecall(Star):
                     idx = num - 1
                     if 0 <= idx < len(target_messages):
                         msg_id = target_messages[idx][0]
-                        ok, err = await self._do_recall(event.bot, msg_id)
+                        ok, err = await self._do_recall(event.bot, msg_id, session_id)
                         if ok:
                             success += 1
                             self._remove_message_from_history(session_id, msg_id)
@@ -938,7 +967,7 @@ class BatchRecall(Star):
                     if msg_id in recalled_ids:
                         continue
                     recalled_ids.append(msg_id)
-                    ok, err = await self._do_recall(event.bot, msg_id)
+                    ok, err = await self._do_recall(event.bot, msg_id, session_id)
                     if ok:
                         success += 1
                         self._remove_message_from_history(session_id, msg_id)
@@ -997,7 +1026,7 @@ class BatchRecall(Star):
             return
 
         session_id = self._get_session_id(event)
-        ok, err = await self._do_recall(event.bot, reply_id)
+        ok, err = await self._do_recall(event.bot, reply_id, session_id)
         self._remove_message_from_history(session_id, reply_id)
 
         if self.conf.get("enable_recall_notification", True):
