@@ -253,8 +253,10 @@ class BatchRecall(Star):
         session_id: str,
         bot_self_id: str,
         sent_at: float,
+        expected_segments: list[dict],
+        response_message_id: int,
     ):
-        """图片等可能被协议端拆分发送时，从群历史补齐各条实际消息ID。"""
+        """从群历史中找出本次发送对应的所有实际消息ID。"""
         try:
             result = await event.bot.call_action(
                 "get_group_msg_history",
@@ -262,7 +264,15 @@ class BatchRecall(Star):
                 count=100,
             )
             messages = result.get("messages", []) if isinstance(result, dict) else []
+            expected_text = "".join(
+                str(segment.get("data", {}).get("text", ""))
+                for segment in expected_segments
+                if segment.get("type") == "text"
+            ).strip()
+            expected_types = {segment.get("type") for segment in expected_segments}
+            split_capable_types = {"image", "record", "video", "file", "face"}
             bot_messages = []
+            recent_bot_ids = []
             for message in messages:
                 sender_id = str(message.get("sender", {}).get("user_id", ""))
                 if sender_id != bot_self_id:
@@ -272,8 +282,33 @@ class BatchRecall(Star):
                 if not message_id:
                     continue
                 msg_time = int(message.get("time", 0) or 0)
-                # OneBot 时间精度通常为秒，保留前一秒以覆盖拆分发送的边界。
-                if msg_time < int(sent_at) - 1:
+                # OneBot 时间戳只有秒级精度，扩大窗口后再按本次消息内容过滤。
+                if msg_time < int(sent_at) - 5:
+                    continue
+                recent_bot_ids.append(int(message_id))
+
+                raw_message = message.get("message", [])
+                if isinstance(raw_message, list):
+                    candidate_text = "".join(
+                        str(segment.get("data", {}).get("text", ""))
+                        for segment in raw_message
+                        if segment.get("type") == "text"
+                    ).strip()
+                    candidate_types = {segment.get("type") for segment in raw_message}
+                else:
+                    candidate_text = str(raw_message).strip()
+                    candidate_types = set()
+
+                text_matches = bool(
+                    expected_text
+                    and candidate_text
+                    and (
+                        expected_text in candidate_text
+                        or candidate_text in expected_text
+                    )
+                )
+                media_matches = bool(expected_types & candidate_types & split_capable_types)
+                if int(message_id) != int(response_message_id) and not (text_matches or media_matches):
                     continue
                 bot_messages.append((msg_time, int(message_id), message))
 
@@ -299,7 +334,15 @@ class BatchRecall(Star):
                 if self._schedule_auto_recall(event.bot, message_id, session_id):
                     added_count += 1
 
-            logger.info(f"📥 从群消息历史补入 {added_count} 条机器人消息ID到自动撤回队列")
+            captured_ids = [
+                message_id
+                for _, message_id, _ in sorted(bot_messages, key=lambda item: (item[0], item[1]))
+            ]
+            logger.info(
+                f"📥 群历史近5秒机器人消息ID候选: {recent_bot_ids}；"
+                f"匹配本次发送: {captured_ids}；"
+                f"新增入队 {added_count} 条"
+            )
         except Exception as exc:
             logger.warning(f"从群消息历史补齐机器人消息ID失败: {exc}")
 
@@ -511,6 +554,8 @@ class BatchRecall(Star):
                         session_id,
                         bot_self_id,
                         send_started_at,
+                        onebot_messages,
+                        message_id,
                     )
                 if self._schedule_auto_recall(event.bot, message_id, session_id):
                     logger.info(f"✅ 已安排消息在 {recall_time} 秒后撤回: {message_id}")
