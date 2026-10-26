@@ -253,8 +253,6 @@ class BatchRecall(Star):
         session_id: str,
         bot_self_id: str,
         sent_at: float,
-        expected_segments: list[dict],
-        response_message_id: int,
     ):
         """从群历史中找出本次发送对应的所有实际消息ID。"""
         try:
@@ -264,13 +262,6 @@ class BatchRecall(Star):
                 count=100,
             )
             messages = result.get("messages", []) if isinstance(result, dict) else []
-            expected_text = "".join(
-                str(segment.get("data", {}).get("text", ""))
-                for segment in expected_segments
-                if segment.get("type") == "text"
-            ).strip()
-            expected_types = {segment.get("type") for segment in expected_segments}
-            split_capable_types = {"image", "record", "video", "file", "face"}
             bot_messages = []
             recent_bot_ids = []
             for message in messages:
@@ -286,30 +277,6 @@ class BatchRecall(Star):
                 if msg_time < int(sent_at) - 5:
                     continue
                 recent_bot_ids.append(int(message_id))
-
-                raw_message = message.get("message", [])
-                if isinstance(raw_message, list):
-                    candidate_text = "".join(
-                        str(segment.get("data", {}).get("text", ""))
-                        for segment in raw_message
-                        if segment.get("type") == "text"
-                    ).strip()
-                    candidate_types = {segment.get("type") for segment in raw_message}
-                else:
-                    candidate_text = str(raw_message).strip()
-                    candidate_types = set()
-
-                text_matches = bool(
-                    expected_text
-                    and candidate_text
-                    and (
-                        expected_text in candidate_text
-                        or candidate_text in expected_text
-                    )
-                )
-                media_matches = bool(expected_types & candidate_types & split_capable_types)
-                if int(message_id) != int(response_message_id) and not (text_matches or media_matches):
-                    continue
                 bot_messages.append((msg_time, int(message_id), message))
 
             added_count = 0
@@ -339,8 +306,8 @@ class BatchRecall(Star):
                 for _, message_id, _ in sorted(bot_messages, key=lambda item: (item[0], item[1]))
             ]
             logger.info(
-                f"📥 群历史近5秒机器人消息ID候选: {recent_bot_ids}；"
-                f"匹配本次发送: {captured_ids}；"
+                f"📥 群历史近5秒机器人消息ID: {recent_bot_ids}；"
+                f"按发送顺序入队: {captured_ids}；"
                 f"新增入队 {added_count} 条"
             )
         except Exception as exc:
@@ -554,8 +521,6 @@ class BatchRecall(Star):
                         session_id,
                         bot_self_id,
                         send_started_at,
-                        onebot_messages,
-                        message_id,
                     )
                 if self._schedule_auto_recall(event.bot, message_id, session_id):
                     logger.info(f"✅ 已安排消息在 {recall_time} 秒后撤回: {message_id}")
