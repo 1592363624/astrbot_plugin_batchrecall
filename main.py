@@ -30,6 +30,10 @@ class BatchRecall(Star):
         super().__init__(context)
         self.conf = config
         self.recall_tasks = set()
+        self._recall_queue: asyncio.Queue = asyncio.Queue()
+        self._recall_worker: Optional[asyncio.Task] = None
+        self._scheduled_recall_ids: dict[tuple[str, int], float] = {}
+        self._pending_no_auto_recall_sessions: dict[str, int] = {}
         # 同一会话的撤回请求串行执行，避免短时间并发调用被协议端丢弃。
         self._recall_locks: dict[str, asyncio.Lock] = {}
         self._last_recall_at: dict[str, float] = {}
@@ -55,8 +59,8 @@ class BatchRecall(Star):
         sender_name: str,
         is_bot: bool = False,
         msg_time: Optional[int] = None,
-    ):
-        """添加消息到历史记录，保持最新消息在最前面（编号1为最新）"""
+    ) -> bool:
+        """添加消息到历史记录，返回是否为新消息。"""
         if session_id not in self.message_history:
             self.message_history[session_id] = []
 
@@ -66,7 +70,7 @@ class BatchRecall(Star):
         # 检查是否已存在此消息ID（避免重复）
         for existing in self.message_history[session_id]:
             if existing[0] == message_id:
-                return
+                return False
 
         # 插入到最前面（最新消息编号为1）
         self.message_history[session_id].insert(
@@ -76,6 +80,7 @@ class BatchRecall(Star):
         # 限制历史记录长度
         if len(self.message_history[session_id]) > self.max_history:
             self.message_history[session_id] = self.message_history[session_id][:self.max_history]
+        return True
 
     def _remove_message_from_history(self, session_id: str, message_id: int):
         """从历史记录中移除已撤回的消息"""
@@ -112,6 +117,20 @@ class BatchRecall(Star):
     def _mark_no_auto_recall(self):
         """标记下一条机器人消息为指令回复：正常发送和记录，但不自动撤回"""
         self._no_auto_recall_count += 1
+
+    def _reserve_no_auto_recall_echo(self, session_id: str):
+        session_id = str(session_id)
+        self._pending_no_auto_recall_sessions[session_id] = (
+            self._pending_no_auto_recall_sessions.get(session_id, 0) + 1
+        )
+
+    def _release_no_auto_recall_echo(self, session_id: str):
+        session_id = str(session_id)
+        pending = self._pending_no_auto_recall_sessions.get(session_id, 0)
+        if pending <= 1:
+            self._pending_no_auto_recall_sessions.pop(session_id, None)
+        else:
+            self._pending_no_auto_recall_sessions[session_id] = pending - 1
 
     def _strip_command_prefix(self, text: str) -> str:
         """剥离开头的命令前缀符号（/、.、!、#等，包括中英文全半角符号），返回去除前缀后的文本"""
@@ -168,15 +187,54 @@ class BatchRecall(Star):
             return True
         return False
 
-    async def _recall_msg(self, client, message_id: int, session_id: Optional[str] = None):
-        """自动撤回消息"""
-        recall_time = self.conf["recall_time"]
-        logger.info(f"⏰ 等待 {recall_time} 秒后撤回消息 {message_id}")
-
-        await asyncio.sleep(recall_time)
+    def _schedule_auto_recall(self, client, message_id: int, session_id: str):
+        """把自动撤回任务按先进先出顺序加入队列。"""
         if not message_id:
-            return
+            return False
 
+        message_id = int(message_id)
+        session_id = str(session_id)
+        recall_key = (session_id, message_id)
+        now = time.monotonic()
+        if len(self._scheduled_recall_ids) % 128 == 0:
+            self._scheduled_recall_ids = {
+                key: expires_at
+                for key, expires_at in self._scheduled_recall_ids.items()
+                if expires_at > now
+            }
+        if self._scheduled_recall_ids.get(recall_key, 0.0) > now:
+            return False
+
+        recall_time = max(0.0, float(self.conf["recall_time"]))
+        due_at = now + recall_time
+        self._scheduled_recall_ids[recall_key] = due_at + 5.0
+        self._recall_queue.put_nowait((due_at, client, message_id, session_id))
+        logger.info(f"📥 消息 {message_id} 已加入自动撤回队列，队列长度: {self._recall_queue.qsize()}")
+
+        if self._recall_worker is None or self._recall_worker.done():
+            self._recall_worker = asyncio.create_task(self._process_recall_queue())
+            self.recall_tasks.add(self._recall_worker)
+            self._recall_worker.add_done_callback(self._remove_task)
+        return True
+
+    async def _process_recall_queue(self):
+        """按入队顺序逐条等待并撤回消息。"""
+        while True:
+            due_at, client, message_id, session_id = await self._recall_queue.get()
+            try:
+                delay = max(0.0, due_at - time.monotonic())
+                logger.info(f"⏰ 等待 {delay:.2f} 秒后撤回队列消息 {message_id}")
+                await asyncio.sleep(delay)
+                await self._recall_msg(client, message_id, session_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"处理自动撤回队列消息失败，message_id={message_id}: {e}")
+            finally:
+                self._recall_queue.task_done()
+
+    async def _recall_msg(self, client, message_id: int, session_id: Optional[str] = None):
+        """执行队列中的自动撤回消息。"""
         ok, err = await self._do_recall(client, message_id, session_id)
         if ok:
             logger.info(f"✅ 已自动撤回消息: {message_id}")
@@ -188,6 +246,62 @@ class BatchRecall(Star):
                 self._remove_message_from_history(session_id, message_id)
         else:
             logger.error(f"撤回消息失败，message_id={message_id}: {err}")
+
+    async def _queue_recent_bot_messages(
+        self,
+        event: AiocqhttpMessageEvent,
+        session_id: str,
+        bot_self_id: str,
+        sent_at: float,
+    ):
+        """图片等可能被协议端拆分发送时，从群历史补齐各条实际消息ID。"""
+        try:
+            result = await event.bot.call_action(
+                "get_group_msg_history",
+                group_id=int(session_id),
+                count=20,
+            )
+            messages = result.get("messages", []) if isinstance(result, dict) else []
+            bot_messages = []
+            for message in messages:
+                sender_id = str(message.get("sender", {}).get("user_id", ""))
+                if sender_id != bot_self_id:
+                    continue
+
+                message_id = message.get("message_id")
+                if not message_id:
+                    continue
+                msg_time = int(message.get("time", 0) or 0)
+                # OneBot 时间精度通常为秒，保留前一秒以覆盖拆分发送的边界。
+                if msg_time < int(sent_at) - 1:
+                    continue
+                bot_messages.append((msg_time, int(message_id), message))
+
+            added_count = 0
+            for msg_time, message_id, message in sorted(bot_messages, key=lambda item: (item[0], item[1])):
+                sender_info = message.get("sender", {})
+                raw_message = message.get("message", [])
+                if isinstance(raw_message, list):
+                    content = self._extract_message_content_from_segments(raw_message)
+                else:
+                    content = str(raw_message)[:50]
+                sender_name = sender_info.get("card") or sender_info.get("nickname", "机器人")
+
+                self._add_message_to_history(
+                    session_id,
+                    message_id,
+                    content,
+                    bot_self_id,
+                    sender_name,
+                    is_bot=True,
+                    msg_time=msg_time,
+                )
+                if self._schedule_auto_recall(event.bot, message_id, session_id):
+                    added_count += 1
+
+            logger.info(f"📥 从群消息历史补入 {added_count} 条机器人消息ID到自动撤回队列")
+        except Exception as exc:
+            logger.warning(f"从群消息历史补齐机器人消息ID失败: {exc}")
 
     def _should_enable_recall(self, event: AstrMessageEvent) -> bool:
         """判断是否应该启用自动撤回"""
@@ -280,16 +394,26 @@ class BatchRecall(Star):
             is_bot = (sender_id == bot_self_id)
 
             # 用户发的插件指令消息不记录（避免编号偏移）
-            # bot自己发的消息由intercept_and_recall记录，这里如果收到（某些协议端可能推送）也跳过避免重复
+            # 机器人自己的消息事件用 message_id 去重；若协议端逐条推送，可补齐实际发送ID。
             if not is_bot and self._is_plugin_command(content):
                 return
 
             sender_name = raw_event.get("sender", {}).get("card") or raw_event.get("sender", {}).get("nickname", "未知")
             msg_time = raw_event.get("time", int(time.time()))
 
-            self._add_message_to_history(
+            is_new_message = self._add_message_to_history(
                 session_id, int(message_id), content, sender_id, sender_name, is_bot, int(msg_time)
             )
+            # 有些 OneBot 端会把机器人发送的图片/连续消息逐条作为消息事件推送；
+            # 这些事件各自有 message_id，逐条入队才能覆盖发送接口只返回最后一个 ID 的情况。
+            if (
+                is_bot
+                and is_new_message
+                and self._pending_no_auto_recall_sessions.get(session_id, 0) == 0
+                and self._should_enable_recall(event)
+            ):
+                logger.info(f"📨 捕获到机器人发出的消息事件，message_id={message_id}")
+                self._schedule_auto_recall(event.bot, int(message_id), session_id)
         except Exception as e:
             logger.error(f"记录消息到历史失败: {e}")
 
@@ -299,6 +423,7 @@ class BatchRecall(Star):
         拦截机器人发出的消息，手动发送、记录到历史，并按需安排自动撤回
         指令回复消息（计数器>0时）正常记录但不自动撤回
         """
+        pending_no_auto_reserved = False
         try:
             if not isinstance(event, AiocqhttpMessageEvent):
                 return
@@ -324,6 +449,11 @@ class BatchRecall(Star):
             is_group = bool(event.get_group_id())
             session_id = self._get_session_id(event)
             bot_self_id = str(event.get_self_id())
+            send_started_at = time.time()
+            if is_command_reply:
+                # 发送期间若协议端推送机器人自己的消息事件，不要把指令回复加入自动撤回队列。
+                self._reserve_no_auto_recall_echo(session_id)
+                pending_no_auto_reserved = True
 
             try:
                 if is_group:
@@ -339,6 +469,9 @@ class BatchRecall(Star):
                         message=onebot_messages,
                     )
             except Exception as send_exc:
+                if pending_no_auto_reserved:
+                    self._release_no_auto_recall_echo(session_id)
+                    pending_no_auto_reserved = False
                 logger.error(f"发送消息失败: {send_exc}")
                 return
 
@@ -347,6 +480,9 @@ class BatchRecall(Star):
                 message_id = send_result.get("message_id")
 
             if not message_id:
+                if pending_no_auto_reserved:
+                    self._release_no_auto_recall_echo(session_id)
+                    pending_no_auto_reserved = False
                 logger.error("❌ 发送消息失败，无法获取消息ID")
                 return
 
@@ -359,17 +495,33 @@ class BatchRecall(Star):
             self._add_message_to_history(
                 session_id, message_id, content_preview, bot_self_id, bot_name, is_bot=True
             )
+            if pending_no_auto_reserved:
+                self._release_no_auto_recall_echo(session_id)
+                pending_no_auto_reserved = False
 
             # 指令回复不自动撤回；普通消息按配置决定是否自动撤回
             if not is_command_reply and self._should_enable_recall(event):
                 recall_time = self.conf["recall_time"]
                 logger.info(f"🎯 拦截到机器人消息，{recall_time}秒后撤回")
-                task = asyncio.create_task(self._recall_msg(event.bot, message_id, session_id))
-                task.add_done_callback(self._remove_task)
-                self.recall_tasks.add(task)
-                logger.info(f"✅ 已安排消息在 {recall_time} 秒后撤回")
+                # 图片链在部分协议端可能拆成多条实际消息；先从历史补齐所有ID，
+                # 再把发送接口返回的ID作为兜底加入FIFO队列。
+                has_image = any(
+                    isinstance(segment, dict) and segment.get("type") == "image"
+                    for segment in onebot_messages
+                )
+                if is_group and has_image:
+                    await self._queue_recent_bot_messages(
+                        event,
+                        session_id,
+                        bot_self_id,
+                        send_started_at,
+                    )
+                if self._schedule_auto_recall(event.bot, message_id, session_id):
+                    logger.info(f"✅ 已安排消息在 {recall_time} 秒后撤回: {message_id}")
 
         except Exception as e:
+            if pending_no_auto_reserved and "session_id" in locals():
+                self._release_no_auto_recall_echo(session_id)
             logger.error(f"消息拦截处理失败: {e}")
 
     async def _do_recall(
@@ -443,6 +595,10 @@ class BatchRecall(Star):
                 task.cancel()
         await asyncio.gather(*self.recall_tasks, return_exceptions=True)
         self.recall_tasks.clear()
+        self._recall_worker = None
+        self._recall_queue = asyncio.Queue()
+        self._scheduled_recall_ids.clear()
+        self._pending_no_auto_recall_sessions.clear()
         logger.info("批量撤回插件已卸载")
 
     async def _load_history_from_api(self, event: AiocqhttpMessageEvent, session_id: str):
