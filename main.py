@@ -7,11 +7,8 @@
 支持任意命令前缀（/、.、!等），参数提取优先使用AstrBot框架解析后的消息段
 """
 import asyncio
-import base64
-import hashlib
 import re
 import time
-from collections import Counter
 from typing import Optional
 
 from aiocqhttp.exceptions import ActionFailed
@@ -36,7 +33,6 @@ class BatchRecall(Star):
     HISTORY_MAX_PAGES = 3
     HISTORY_SCAN_LOOKBACK_SECONDS = 15
     HISTORY_SETTLE_DELAY = 0.5
-    HISTORY_BOT_BURST_WINDOW_SECONDS = 3
 
     def __init__(self, context: Context, config):
         super().__init__(context)
@@ -478,434 +474,12 @@ class BatchRecall(Star):
             seconds = self.HISTORY_SCAN_LOOKBACK_SECONDS
         return max(0, min(seconds, 15))
 
-    @staticmethod
-    def _hash_file_value(value) -> Optional[str]:
-        """将文件哈希、内联文件数据或文件标识转换为稳定指纹。"""
-        if isinstance(value, bytes):
-            return "content:" + hashlib.sha256(value).hexdigest()
-        if isinstance(value, dict):
-            for key in (
-                "sha256", "md5", "file_hash", "hash", "file", "file_id",
-                "fid", "url", "path",
-            ):
-                if key in value:
-                    fingerprint = BatchRecall._hash_file_value(value[key])
-                    if fingerprint:
-                        return fingerprint
-            return None
-        if not isinstance(value, str):
-            return None
-
-        file_value = value.strip()
-        if not file_value:
-            return None
-
-        encoded_data = None
-        if file_value.casefold().startswith("base64://"):
-            encoded_data = file_value[len("base64://") :]
-        elif file_value.casefold().startswith("data:") and ";base64," in file_value:
-            encoded_data = file_value.split(",", 1)[1]
-        if encoded_data is not None:
-            try:
-                decoded = base64.b64decode(encoded_data, validate=False)
-                return "content:" + hashlib.sha256(decoded).hexdigest()
-            except (ValueError, TypeError):
-                pass
-
-        # OneBot/适配器有时直接把 MD5 或 SHA 哈希放在 file、URL 或专用字段中。
-        hash_match = re.search(
-            r"(?i)(?<![0-9a-f])([0-9a-f]{32}|[0-9a-f]{64})(?![0-9a-f])",
-            file_value,
-        )
-        if hash_match:
-            return "content:" + hash_match.group(1).lower()
-
-        # 无显式内容哈希时，对稳定的 file/url/file_id 字段求哈希，避免日志泄露原始路径。
-        return "ref:" + hashlib.sha256(file_value.encode("utf-8")).hexdigest()
-
-    def _get_message_signature(
-        self, message
-    ) -> tuple[str, str, list[str], list[str], dict[str, int]]:
-        """提取规范化文本哈希、文件哈希和媒体类型。"""
-        text_parts = []
-        text_hashes = []
-        file_hashes = []
-        media_counts: dict[str, int] = {}
-
-        def canonical_media_type(segment_type: str) -> Optional[str]:
-            # 不同 OneBot 实现和 AstrBot 组件可能使用大小写、下划线或
-            # Segment 类名等不同写法，先统一格式再映射到媒体类别。
-            segment_type = re.sub(r"[^a-z0-9]", "", segment_type.casefold())
-            if segment_type in {
-                "image", "imagesegment", "img", "pic", "picture",
-                "flash", "flashimage", "flashimagesegment", "mface",
-            }:
-                return "image"
-            if segment_type in {"record", "recordsegment", "audio", "audiosegment"}:
-                return "record"
-            if segment_type in {"video", "videosegment", "shortvideo"}:
-                return "video"
-            if segment_type in {"file", "filesegment", "attachment"}:
-                return "file"
-            if segment_type in {"face", "facesegment", "emoji", "emoticon"}:
-                return "face"
-            return None
-
-        def first_file_fingerprint(value) -> Optional[str]:
-            if isinstance(value, dict):
-                for key in (
-                    "sha256", "md5", "file_hash", "hash", "file", "file_id", "fid",
-                    "url", "path",
-                ):
-                    if key not in value:
-                        continue
-                    fingerprint = first_file_fingerprint(value[key])
-                    if fingerprint:
-                        return fingerprint
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    fingerprint = first_file_fingerprint(item)
-                    if fingerprint:
-                        return fingerprint
-            else:
-                return self._hash_file_value(value)
-            return None
-
-        def add_raw_text(raw_text: str):
-            for cq_match in re.finditer(
-                r"\[CQ:([a-zA-Z0-9_]+)([^\]]*)\]", raw_text, flags=re.IGNORECASE
-            ):
-                media_type = canonical_media_type(cq_match.group(1))
-                if media_type:
-                    media_counts[media_type] = media_counts.get(media_type, 0) + 1
-                    for field in ("file", "file_id", "fid", "md5", "sha256", "url"):
-                        file_match = re.search(
-                            rf"(?:^|,){field}=([^,]+)",
-                            cq_match.group(2),
-                            flags=re.IGNORECASE,
-                        )
-                        if not file_match:
-                            continue
-                        fingerprint = self._hash_file_value(file_match.group(1))
-                        if fingerprint:
-                            file_hashes.append(fingerprint)
-                            break
-            # 某些历史接口会把无法还原的图片段折叠成可读占位符，而不是
-            # 返回 OneBot image segment 或 CQ 码。
-            image_placeholders = re.findall(
-                r"\[(?:图片|image|img|pic|photo)\]|【图片】",
-                raw_text,
-                flags=re.IGNORECASE,
-            )
-            if image_placeholders:
-                media_counts["image"] = media_counts.get("image", 0) + len(
-                    image_placeholders
-                )
-            raw_text = re.sub(r"\[CQ:[^\]]+\]", "", raw_text, flags=re.IGNORECASE)
-            raw_text = re.sub(
-                r"\[(?:图片|image|img|pic|photo)\]|【图片】",
-                "",
-                raw_text,
-                flags=re.IGNORECASE,
-            )
-            text_parts.append(raw_text)
-            normalized_segment = re.sub(r"\s+", "", raw_text).casefold()
-            if normalized_segment:
-                text_hashes.append(
-                    hashlib.sha256(normalized_segment.encode("utf-8")).hexdigest()
-                )
-
-        def visit_segments(value):
-            if isinstance(value, (list, tuple)):
-                for item in value:
-                    visit_segments(item)
-                return
-            if isinstance(value, str):
-                add_raw_text(value)
-                return
-            if not isinstance(value, dict):
-                return
-
-            segment_type = str(value.get("type", "")).rsplit(".", 1)[-1].lower()
-            data = value.get("data", {})
-            if segment_type == "text":
-                text = data.get("text", "") if isinstance(data, dict) else ""
-                add_raw_text(str(text))
-                return
-
-            media_type = canonical_media_type(segment_type)
-            if media_type:
-                media_counts[media_type] = media_counts.get(media_type, 0) + 1
-                fingerprint = first_file_fingerprint(data)
-                if fingerprint:
-                    file_hashes.append(fingerprint)
-                return
-
-            # 转发、合并转发和部分适配器的历史记录会把真实消息段嵌套在
-            # message/content/segments 等字段下；同时兼容无 type 的包装对象。
-            nested_keys = (
-                "content", "message", "message_chain", "chain", "segments",
-                "nodes", "elements", "children", "items",
-            )
-            for container in (value, data):
-                if isinstance(container, dict):
-                    for key in nested_keys:
-                        if key in container:
-                            visit_segments(container[key])
-                elif isinstance(container, (list, tuple)):
-                    visit_segments(container)
-                elif isinstance(container, str) and re.search(
-                    r"\[CQ:|\[(?:图片|image|img|pic|photo)\]|【图片】",
-                    container,
-                    flags=re.IGNORECASE,
-                ):
-                    visit_segments(container)
-
-        visit_segments(message)
-
-        normalized_text = re.sub(r"\s+", "", "".join(text_parts)).casefold()
-        text_hash = (
-            hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
-            if normalized_text
-            else ""
-        )
-        return normalized_text, text_hash, text_hashes, file_hashes, media_counts
-
-    @staticmethod
-    def _truncate_match_log(value: str, max_length: int = 80) -> str:
-        """压缩换行并截断匹配日志中的消息内容。"""
-        value = re.sub(r"\s+", " ", value)
-        if len(value) <= max_length:
-            return value
-        return value[:max_length] + "…"
-
-    def _match_current_send_history(
-        self,
-        bot_messages: list[tuple[int, int, dict]],
-        expected_segments: list[dict],
-        response_message_id: int,
-    ) -> tuple[list[tuple[int, int, dict]], str]:
-        """通过文本内容哈希和文件哈希，从近期历史中定位本次发送的消息。"""
-        (
-            expected_text,
-            expected_text_hash,
-            expected_text_hashes,
-            expected_file_hashes,
-            expected_media,
-        ) = self._get_message_signature(expected_segments)
-        ordered_messages = sorted(bot_messages, key=lambda item: item[0])
-        signatures = [
-            self._get_message_signature(message.get("message", []))
-            for _, _, message in ordered_messages
-        ]
-        response_index = next(
-            (
-                index
-                for index, item in enumerate(ordered_messages)
-                if item[1] == int(response_message_id)
-            ),
-            None,
-        )
-
-        matched_by_id: dict[int, tuple[int, int, dict]] = {}
-        match_reasons: dict[int, set[str]] = {}
-
-        def add_match(index: int, reason: str):
-            item = ordered_messages[index]
-            message_id = item[1]
-            matched_by_id[message_id] = item
-            match_reasons.setdefault(message_id, set()).add(reason)
-
-        if response_index is not None:
-            add_match(response_index, "接口返回ID")
-
-        # 先查找一段连续历史文本，其拼接内容哈希与完整待发送文本一致。
-        full_text_run = None
-        if expected_text and expected_text_hash:
-            matching_runs = []
-            for start in range(len(ordered_messages)):
-                combined_text = ""
-                for end in range(start, len(ordered_messages)):
-                    combined_text += signatures[end][0]
-                    if len(combined_text) > len(expected_text):
-                        break
-                    if not combined_text or len(combined_text) < len(expected_text):
-                        continue
-                    combined_hash = hashlib.sha256(
-                        combined_text.encode("utf-8")
-                    ).hexdigest()
-                    if combined_hash == expected_text_hash:
-                        matching_runs.append((start, end))
-                    break
-
-            if matching_runs:
-                anchor_index = (
-                    response_index
-                    if response_index is not None
-                    else len(ordered_messages) - 1
-                )
-                full_text_run = min(
-                    matching_runs,
-                    key=lambda run: (
-                        0 if run[0] <= anchor_index <= run[1] else 1,
-                        abs(run[1] - anchor_index),
-                        run[1] - run[0],
-                    ),
-                )
-                for index in range(full_text_run[0], full_text_run[1] + 1):
-                    add_match(index, "完整文本hash")
-
-        # 如果历史按原消息拆分，完整文本 hash 已覆盖全部文本；否则逐段按 hash 匹配。
-        if full_text_run is None and expected_text_hashes:
-            remaining_text_hashes = Counter(expected_text_hashes)
-            candidate_indexes = sorted(
-                range(len(ordered_messages)),
-                key=lambda index: (
-                    abs(index - response_index)
-                    if response_index is not None
-                    else len(ordered_messages) - 1 - index,
-                    -index,
-                ),
-            )
-            for index in candidate_indexes:
-                candidate_hashes = Counter(signatures[index][2])
-                candidate_text_hash = signatures[index][1]
-                if candidate_text_hash:
-                    candidate_hashes[candidate_text_hash] = max(
-                        candidate_hashes[candidate_text_hash], 1
-                    )
-                matched_hashes = []
-                for text_hash, count in candidate_hashes.items():
-                    matched_count = min(count, remaining_text_hashes[text_hash])
-                    if matched_count:
-                        remaining_text_hashes[text_hash] -= matched_count
-                        matched_hashes.append(text_hash[:12])
-                if matched_hashes:
-                    add_match(index, f"文本hash:{','.join(matched_hashes)}")
-
-        # 文件/图片只按显式文件哈希、内联文件内容哈希或稳定文件标识哈希关联。
-        if expected_file_hashes:
-            remaining_file_hashes = Counter(expected_file_hashes)
-            candidate_indexes = sorted(
-                range(len(ordered_messages)),
-                key=lambda index: (
-                    abs(index - response_index)
-                    if response_index is not None
-                    else len(ordered_messages) - 1 - index,
-                    -index,
-                ),
-            )
-            for index in candidate_indexes:
-                candidate_hashes = Counter(signatures[index][3])
-                matched_hashes = []
-                for file_hash, count in candidate_hashes.items():
-                    matched_count = min(count, remaining_file_hashes[file_hash])
-                    if matched_count:
-                        remaining_file_hashes[file_hash] -= matched_count
-                        matched_hashes.append(file_hash[:20])
-                if matched_hashes:
-                    add_match(index, f"文件hash:{','.join(matched_hashes)}")
-
-        matched = sorted(matched_by_id.values(), key=lambda item: item[0])
-        matched_log = []
-        for item in matched:
-            index = next(
-                (
-                    candidate_index
-                    for candidate_index, candidate in enumerate(ordered_messages)
-                    if candidate[1] == item[1]
-                ),
-                None,
-            )
-            if index is None:
-                continue
-            signature = signatures[index]
-            matched_log.append(
-                f"{item[1]}({','.join(sorted(match_reasons[item[1]]))};"
-                f"text={signature[1][:12] or '-'};"
-                f"file={[value[:20] for value in signature[3]]};"
-                f"内容={self._truncate_match_log(signature[0], 60)!r})"
-            )
-
-        candidate_log = []
-        for index in range(max(0, len(ordered_messages) - 10), len(ordered_messages)):
-            item = ordered_messages[index]
-            signature = signatures[index]
-            candidate_log.append(
-                f"{item[1]}(text={signature[1][:12] or '-'};"
-                f"file={[value[:20] for value in signature[3]]};"
-                f"内容={self._truncate_match_log(signature[0], 40)!r})"
-            )
-
-        debug = (
-            f"发送文本hash={expected_text_hash[:12] or '-'}，"
-            f"文本段hash={[value[:12] for value in expected_text_hashes]}，"
-            f"文件hash={[value[:20] for value in expected_file_hashes]}，"
-            f"媒体计数={expected_media}；连续全文匹配={full_text_run is not None}；"
-            f"命中={matched_log}；近期候选={candidate_log}"
-        )
-        return matched, self._truncate_match_log(debug, 1800)
-
-    def _get_recent_bot_burst(
-        self,
-        messages: list[dict],
-        bot_self_id: str,
-        anchor_message_id: int,
-    ) -> tuple[list[tuple[int, int, dict]], str]:
-        """以已匹配的机器人消息为锚点，补齐同一轮用户输入后的机器人连发消息。"""
-        timeline = []
-        anchor_index = None
-        for original_index, message in enumerate(messages):
-            message_id = message.get("message_id")
-            if not message_id:
-                continue
-            message_time = int(message.get("time", 0) or 0)
-            timeline.append((message_time, original_index, int(message_id), message))
-
-        timeline.sort(key=lambda item: (item[0], item[1]))
-        for index, (_, _, message_id, _) in enumerate(timeline):
-            if message_id == int(anchor_message_id):
-                anchor_index = index
-                break
-        if anchor_index is None:
-            return [], f"找不到锚点消息 {anchor_message_id}"
-
-        anchor_time, _, _, _ = timeline[anchor_index]
-        previous_user_index = None
-        for index in range(anchor_index - 1, -1, -1):
-            sender_id = str(timeline[index][3].get("sender", {}).get("user_id", ""))
-            if sender_id != bot_self_id:
-                previous_user_index = index
-                break
-
-        if previous_user_index is not None:
-            burst_timeline = timeline[previous_user_index + 1 : anchor_index + 1]
-            boundary = f"最近非机器人消息ID {timeline[previous_user_index][2]}"
-        else:
-            burst_timeline = [
-                item
-                for item in timeline
-                if anchor_time - self.HISTORY_BOT_BURST_WINDOW_SECONDS
-                <= item[0]
-                <= anchor_time
-            ]
-            boundary = f"锚点前 {self.HISTORY_BOT_BURST_WINDOW_SECONDS} 秒突发窗口"
-
-        burst = []
-        for message_time, _, message_id, message in burst_timeline:
-            sender_id = str(message.get("sender", {}).get("user_id", ""))
-            if sender_id == bot_self_id:
-                burst.append((message_time, message_id, message))
-        burst_ids = [message_id for _, message_id, _ in burst]
-        return burst, f"{boundary}，突发消息ID {burst_ids[:20]}"
-
     async def _queue_recent_bot_messages(
         self,
         event: AiocqhttpMessageEvent,
         session_id: str,
         bot_self_id: str,
         sent_at: float,
-        expected_segments: list[dict],
         response_message_id: int,
         scheduled_at: Optional[float] = None,
     ):
@@ -927,29 +501,19 @@ class BatchRecall(Star):
                 msg_time = int(message.get("time", 0) or 0)
                 bot_candidates.append((msg_time, int(message_id), message))
 
-            content_match_enabled = bool(
-                self.conf.get("enable_history_content_match", True)
+            history_window_recall = bool(
+                self.conf.get("enable_history_window_recall", False)
             )
-            if content_match_enabled:
-                bot_messages, match_debug = self._match_current_send_history(
-                    bot_candidates, expected_segments, response_message_id
-                )
-                anchor_message_id = int(response_message_id)
-                if not any(mid == anchor_message_id for _, mid, _ in bot_candidates):
-                    if bot_messages:
-                        anchor_message_id = max(bot_messages, key=lambda item: item[0])[1]
-                burst_messages, burst_debug = self._get_recent_bot_burst(
-                    messages, bot_self_id, anchor_message_id
-                )
-                matched_ids = {message_id for _, message_id, _ in bot_messages}
-                for burst_message in burst_messages:
-                    if burst_message[1] not in matched_ids:
-                        bot_messages.append(burst_message)
-                        matched_ids.add(burst_message[1])
-                match_debug = f"{match_debug}；同轮消息补齐：{burst_debug}"
-            else:
+            if history_window_recall:
                 bot_messages = bot_candidates
-                match_debug = "内容匹配关闭，使用时间窗口内全部机器人消息"
+                match_debug = "历史窗口模式，撤回窗口内所有机器人消息"
+            else:
+                bot_messages = [
+                    item
+                    for item in bot_candidates
+                    if item[1] == int(response_message_id)
+                ]
+                match_debug = f"仅撤回发送接口返回的消息ID {response_message_id}"
 
             added_count = 0
             # 先补录新消息，保持本地编号列表按时间倒序排列。
@@ -1000,7 +564,7 @@ class BatchRecall(Star):
                 f"📥 {'群' if is_group else '私聊'}历史补录完成：API返回 {api_message_count} 条，"
                 f"窗口内 {len(messages)} 条，"
                 f"机器人候选 {len(bot_candidates)} 条，候选ID {candidate_ids[:20]}，"
-                f"{'内容匹配' if content_match_enabled else '时间窗口'}筛选后 "
+                f"{'历史窗口' if history_window_recall else '发送ID'}模式筛选后 "
                 f"{len(bot_messages)} 条，ID {captured_ids[:20]}，扫描窗口 "
                 f"{self._get_history_scan_lookback_seconds()} 秒，"
                 f"匹配详情：{match_debug}；"
@@ -1228,7 +792,6 @@ class BatchRecall(Star):
                         session_id,
                         bot_self_id,
                         send_started_at,
-                        onebot_messages,
                         message_id,
                         scheduled_at=send_started_monotonic,
                     )
