@@ -606,7 +606,7 @@ class BatchRecall(Star):
                 bot_candidates.append((msg_time, int(message_id), message))
 
             content_match_enabled = bool(
-                self.conf.get("enable_history_content_match", False)
+                self.conf.get("enable_history_content_match", True)
             )
             if content_match_enabled:
                 bot_messages = self._match_current_send_history(
