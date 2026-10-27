@@ -23,6 +23,12 @@
         "hint": "是否在群聊中启用撤回功能",
         "default": true
     },
+    "skip_video_recall": {
+        "description": "撤回跳过视频消息",
+        "type": "bool",
+        "hint": "开启后，自动撤回会跳过包含视频段或视频文件的消息；关闭时视频消息按其他撤回规则处理",
+        "default": false
+    },
     "group_whitelist": {
         "description": "白名单群聊",
         "type": "list",

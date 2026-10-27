@@ -140,6 +140,64 @@ class BatchRecall(Star):
         content = "".join(content_parts)
         return content[:50] if content else "[无文本内容]"
 
+    def _contains_video_segment(self, message) -> bool:
+        """判断 OneBot 消息或嵌套消息段中是否包含视频。"""
+        if isinstance(message, (list, tuple)):
+            return any(self._contains_video_segment(item) for item in message)
+        if isinstance(message, str):
+            return bool(
+                re.search(
+                    r"\[CQ:(?:video|shortvideo)(?:,|\])|\[(?:视频|video)\]|【视频】",
+                    message,
+                    flags=re.IGNORECASE,
+                )
+            )
+        if not isinstance(message, dict):
+            return False
+
+        segment_type = re.sub(
+            r"[^a-z0-9]", "", str(message.get("type", "")).casefold()
+        )
+        if segment_type in {"video", "videosegment", "shortvideo", "shortvideosegment"}:
+            return True
+
+        data = message.get("data", {})
+        if segment_type == "text":
+            text = data.get("text", "") if isinstance(data, dict) else ""
+            return self._contains_video_segment(str(text))
+
+        if segment_type in {"file", "filesegment", "attachment"} and isinstance(data, dict):
+            for key in ("name", "file", "url"):
+                value = data.get(key)
+                if isinstance(value, str) and re.search(
+                    r"\.(?:mp4|m4v|mov|avi|mkv|webm|wmv|flv)(?:[?#].*)?$",
+                    value,
+                    flags=re.IGNORECASE,
+                ):
+                    return True
+
+        nested_keys = (
+            "content", "message", "message_chain", "chain", "segments",
+            "nodes", "elements", "children", "items",
+        )
+        for container in (message, data):
+            if isinstance(container, dict):
+                if any(
+                    self._contains_video_segment(container[key])
+                    for key in nested_keys
+                    if key in container
+                ):
+                    return True
+            elif isinstance(container, (list, tuple)) and self._contains_video_segment(container):
+                return True
+        return False
+
+    def _should_skip_video_recall(self, message) -> bool:
+        return bool(
+            self.conf.get("skip_video_recall", False)
+            and self._contains_video_segment(message)
+        )
+
     def _remove_task(self, task: asyncio.Task):
         """移除已完成的任务"""
         self.recall_tasks.discard(task)
@@ -540,6 +598,9 @@ class BatchRecall(Star):
                 )
                 if self._is_no_auto_recall_message(session_id, message_id, msg_time):
                     continue
+                if self._should_skip_video_recall(raw_message):
+                    logger.info(f"⏭️ 历史补录跳过视频消息的自动撤回: {message_id}")
+                    continue
                 if self._schedule_auto_recall(
                     event.bot,
                     message_id,
@@ -675,6 +736,7 @@ class BatchRecall(Star):
             is_new_message = self._add_message_to_history(
                 session_id, int(message_id), content, sender_id, sender_name, is_bot, int(msg_time)
             )
+            skip_video_recall = self._should_skip_video_recall(raw_message)
             pending_no_auto_echo = self._pending_no_auto_recall_sessions.get(session_id, 0) > 0
             if is_bot and pending_no_auto_echo:
                 self._remember_no_auto_recall_message(session_id, int(message_id))
@@ -684,11 +746,14 @@ class BatchRecall(Star):
                 is_bot
                 and is_new_message
                 and not pending_no_auto_echo
+                and not skip_video_recall
                 and not self._is_no_auto_recall_message(session_id, int(message_id), int(msg_time))
                 and self._should_enable_recall(event)
             ):
                 logger.info(f"📨 捕获到机器人发出的消息事件，message_id={message_id}")
                 self._schedule_auto_recall(event.bot, int(message_id), session_id)
+            elif is_bot and is_new_message and skip_video_recall:
+                logger.info(f"⏭️ 机器人视频消息跳过自动撤回: {message_id}")
         except Exception as e:
             logger.error(f"记录消息到历史失败: {e}")
 
@@ -730,6 +795,9 @@ class BatchRecall(Star):
             should_auto_recall = (
                 not is_command_reply and self._should_enable_recall(event)
             )
+            if should_auto_recall and self._should_skip_video_recall(onebot_messages):
+                logger.info("⏭️ 当前消息包含视频，按配置跳过自动撤回")
+                should_auto_recall = False
             send_started_at = time.time()
             send_started_monotonic = time.monotonic()
             if is_command_reply:
