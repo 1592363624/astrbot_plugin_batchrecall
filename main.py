@@ -36,6 +36,7 @@ class BatchRecall(Star):
     HISTORY_MAX_PAGES = 3
     HISTORY_SCAN_LOOKBACK_SECONDS = 15
     HISTORY_SETTLE_DELAY = 0.5
+    HISTORY_BOT_BURST_WINDOW_SECONDS = 3
 
     def __init__(self, context: Context, config):
         super().__init__(context)
@@ -845,6 +846,59 @@ class BatchRecall(Star):
         )
         return matched, self._truncate_match_log(debug, 1800)
 
+    def _get_recent_bot_burst(
+        self,
+        messages: list[dict],
+        bot_self_id: str,
+        anchor_message_id: int,
+    ) -> tuple[list[tuple[int, int, dict]], str]:
+        """以已匹配的机器人消息为锚点，补齐同一轮用户输入后的机器人连发消息。"""
+        timeline = []
+        anchor_index = None
+        for original_index, message in enumerate(messages):
+            message_id = message.get("message_id")
+            if not message_id:
+                continue
+            message_time = int(message.get("time", 0) or 0)
+            timeline.append((message_time, original_index, int(message_id), message))
+
+        timeline.sort(key=lambda item: (item[0], item[1]))
+        for index, (_, _, message_id, _) in enumerate(timeline):
+            if message_id == int(anchor_message_id):
+                anchor_index = index
+                break
+        if anchor_index is None:
+            return [], f"找不到锚点消息 {anchor_message_id}"
+
+        anchor_time, _, _, _ = timeline[anchor_index]
+        previous_user_index = None
+        for index in range(anchor_index - 1, -1, -1):
+            sender_id = str(timeline[index][3].get("sender", {}).get("user_id", ""))
+            if sender_id != bot_self_id:
+                previous_user_index = index
+                break
+
+        if previous_user_index is not None:
+            burst_timeline = timeline[previous_user_index + 1 : anchor_index + 1]
+            boundary = f"最近非机器人消息ID {timeline[previous_user_index][2]}"
+        else:
+            burst_timeline = [
+                item
+                for item in timeline
+                if anchor_time - self.HISTORY_BOT_BURST_WINDOW_SECONDS
+                <= item[0]
+                <= anchor_time
+            ]
+            boundary = f"锚点前 {self.HISTORY_BOT_BURST_WINDOW_SECONDS} 秒突发窗口"
+
+        burst = []
+        for message_time, _, message_id, message in burst_timeline:
+            sender_id = str(message.get("sender", {}).get("user_id", ""))
+            if sender_id == bot_self_id:
+                burst.append((message_time, message_id, message))
+        burst_ids = [message_id for _, message_id, _ in burst]
+        return burst, f"{boundary}，突发消息ID {burst_ids[:20]}"
+
     async def _queue_recent_bot_messages(
         self,
         event: AiocqhttpMessageEvent,
@@ -880,6 +934,19 @@ class BatchRecall(Star):
                 bot_messages, match_debug = self._match_current_send_history(
                     bot_candidates, expected_segments, response_message_id
                 )
+                anchor_message_id = int(response_message_id)
+                if not any(mid == anchor_message_id for _, mid, _ in bot_candidates):
+                    if bot_messages:
+                        anchor_message_id = max(bot_messages, key=lambda item: item[0])[1]
+                burst_messages, burst_debug = self._get_recent_bot_burst(
+                    messages, bot_self_id, anchor_message_id
+                )
+                matched_ids = {message_id for _, message_id, _ in bot_messages}
+                for burst_message in burst_messages:
+                    if burst_message[1] not in matched_ids:
+                        bot_messages.append(burst_message)
+                        matched_ids.add(burst_message[1])
+                match_debug = f"{match_debug}；同轮消息补齐：{burst_debug}"
             else:
                 bot_messages = bot_candidates
                 match_debug = "内容匹配关闭，使用时间窗口内全部机器人消息"
