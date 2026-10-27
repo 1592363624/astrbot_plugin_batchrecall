@@ -47,16 +47,16 @@
         "hint": "每个会话最多记录多少条机器人消息用于编号撤回",
         "default": 50
     },
-    "history_scan_lookback_seconds": {
-        "description": "历史消息扫描回看秒数",
-        "type": "int",
-        "hint": "按时间窗口查找机器人历史消息，范围0到15秒",
-        "default": 15
-    },
     "enable_history_window_recall": {
         "description": "开启历史窗口撤回",
         "type": "bool",
         "hint": "开启后会按历史扫描时间窗口撤回其中的机器人消息，也会撤回其他插件发送的消息，请谨慎开启。关闭后仅撤回发送接口返回的消息ID；拆分或连续发送多条消息时可能只撤回最后一条。",
         "default": false
+    },
+    "history_scan_lookback_seconds": {
+        "description": "历史消息扫描回看秒数",
+        "type": "int",
+        "hint": "按时间窗口查找机器人历史消息，范围0到15秒",
+        "default": 15
     }
 }
