@@ -31,7 +31,7 @@ class BatchRecall(Star):
     RETRYABLE_ACTION_RET_CODES = {-1, 1200, 1400}
     HISTORY_PAGE_SIZE = 30
     HISTORY_MAX_PAGES = 3
-    HISTORY_SCAN_LOOKBACK_SECONDS = 10
+    HISTORY_SCAN_LOOKBACK_SECONDS = 15
     HISTORY_SETTLE_DELAY = 0.5
 
     def __init__(self, context: Context, config):
@@ -472,7 +472,7 @@ class BatchRecall(Star):
             )
         except (TypeError, ValueError):
             seconds = self.HISTORY_SCAN_LOOKBACK_SECONDS
-        return max(0, min(seconds, 10))
+        return max(0, min(seconds, 15))
 
     async def _queue_recent_bot_messages(
         self,
