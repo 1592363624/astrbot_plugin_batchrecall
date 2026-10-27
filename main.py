@@ -7,8 +7,11 @@
 支持任意命令前缀（/、.、!等），参数提取优先使用AstrBot框架解析后的消息段
 """
 import asyncio
+import base64
+import hashlib
 import re
 import time
+from collections import Counter
 from typing import Optional
 
 from aiocqhttp.exceptions import ActionFailed
@@ -474,9 +477,58 @@ class BatchRecall(Star):
             seconds = self.HISTORY_SCAN_LOOKBACK_SECONDS
         return max(0, min(seconds, 15))
 
-    def _get_message_signature(self, message) -> tuple[str, dict[str, int]]:
-        """提取消息文本和可匹配媒体类型，用于关联本次发送的拆分消息。"""
+    @staticmethod
+    def _hash_file_value(value) -> Optional[str]:
+        """将文件哈希、内联文件数据或文件标识转换为稳定指纹。"""
+        if isinstance(value, bytes):
+            return "content:" + hashlib.sha256(value).hexdigest()
+        if isinstance(value, dict):
+            for key in (
+                "sha256", "md5", "file_hash", "hash", "file", "file_id",
+                "fid", "url", "path",
+            ):
+                if key in value:
+                    fingerprint = BatchRecall._hash_file_value(value[key])
+                    if fingerprint:
+                        return fingerprint
+            return None
+        if not isinstance(value, str):
+            return None
+
+        file_value = value.strip()
+        if not file_value:
+            return None
+
+        encoded_data = None
+        if file_value.casefold().startswith("base64://"):
+            encoded_data = file_value[len("base64://") :]
+        elif file_value.casefold().startswith("data:") and ";base64," in file_value:
+            encoded_data = file_value.split(",", 1)[1]
+        if encoded_data is not None:
+            try:
+                decoded = base64.b64decode(encoded_data, validate=False)
+                return "content:" + hashlib.sha256(decoded).hexdigest()
+            except (ValueError, TypeError):
+                pass
+
+        # OneBot/适配器有时直接把 MD5 或 SHA 哈希放在 file、URL 或专用字段中。
+        hash_match = re.search(
+            r"(?i)(?<![0-9a-f])([0-9a-f]{32}|[0-9a-f]{64})(?![0-9a-f])",
+            file_value,
+        )
+        if hash_match:
+            return "content:" + hash_match.group(1).lower()
+
+        # 无显式内容哈希时，对稳定的 file/url/file_id 字段求哈希，避免日志泄露原始路径。
+        return "ref:" + hashlib.sha256(file_value.encode("utf-8")).hexdigest()
+
+    def _get_message_signature(
+        self, message
+    ) -> tuple[str, str, list[str], list[str], dict[str, int]]:
+        """提取规范化文本哈希、文件哈希和媒体类型。"""
         text_parts = []
+        text_hashes = []
+        file_hashes = []
         media_counts: dict[str, int] = {}
 
         def canonical_media_type(segment_type: str) -> Optional[str]:
@@ -498,13 +550,45 @@ class BatchRecall(Star):
                 return "face"
             return None
 
+        def first_file_fingerprint(value) -> Optional[str]:
+            if isinstance(value, dict):
+                for key in (
+                    "sha256", "md5", "file_hash", "hash", "file", "file_id", "fid",
+                    "url", "path",
+                ):
+                    if key not in value:
+                        continue
+                    fingerprint = first_file_fingerprint(value[key])
+                    if fingerprint:
+                        return fingerprint
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    fingerprint = first_file_fingerprint(item)
+                    if fingerprint:
+                        return fingerprint
+            else:
+                return self._hash_file_value(value)
+            return None
+
         def add_raw_text(raw_text: str):
-            for raw_segment_type in re.findall(
-                r"\[CQ:([a-zA-Z0-9_]+)", raw_text, flags=re.IGNORECASE
+            for cq_match in re.finditer(
+                r"\[CQ:([a-zA-Z0-9_]+)([^\]]*)\]", raw_text, flags=re.IGNORECASE
             ):
-                media_type = canonical_media_type(raw_segment_type)
+                media_type = canonical_media_type(cq_match.group(1))
                 if media_type:
                     media_counts[media_type] = media_counts.get(media_type, 0) + 1
+                    for field in ("file", "file_id", "fid", "md5", "sha256", "url"):
+                        file_match = re.search(
+                            rf"(?:^|,){field}=([^,]+)",
+                            cq_match.group(2),
+                            flags=re.IGNORECASE,
+                        )
+                        if not file_match:
+                            continue
+                        fingerprint = self._hash_file_value(file_match.group(1))
+                        if fingerprint:
+                            file_hashes.append(fingerprint)
+                            break
             # 某些历史接口会把无法还原的图片段折叠成可读占位符，而不是
             # 返回 OneBot image segment 或 CQ 码。
             image_placeholders = re.findall(
@@ -524,6 +608,11 @@ class BatchRecall(Star):
                 flags=re.IGNORECASE,
             )
             text_parts.append(raw_text)
+            normalized_segment = re.sub(r"\s+", "", raw_text).casefold()
+            if normalized_segment:
+                text_hashes.append(
+                    hashlib.sha256(normalized_segment.encode("utf-8")).hexdigest()
+                )
 
         def visit_segments(value):
             if isinstance(value, (list, tuple)):
@@ -546,6 +635,9 @@ class BatchRecall(Star):
             media_type = canonical_media_type(segment_type)
             if media_type:
                 media_counts[media_type] = media_counts.get(media_type, 0) + 1
+                fingerprint = first_file_fingerprint(data)
+                if fingerprint:
+                    file_hashes.append(fingerprint)
                 return
 
             # 转发、合并转发和部分适配器的历史记录会把真实消息段嵌套在
@@ -571,70 +663,187 @@ class BatchRecall(Star):
         visit_segments(message)
 
         normalized_text = re.sub(r"\s+", "", "".join(text_parts)).casefold()
-        return normalized_text, media_counts
+        text_hash = (
+            hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+            if normalized_text
+            else ""
+        )
+        return normalized_text, text_hash, text_hashes, file_hashes, media_counts
+
+    @staticmethod
+    def _truncate_match_log(value: str, max_length: int = 80) -> str:
+        """压缩换行并截断匹配日志中的消息内容。"""
+        value = re.sub(r"\s+", " ", value)
+        if len(value) <= max_length:
+            return value
+        return value[:max_length] + "…"
 
     def _match_current_send_history(
         self,
         bot_messages: list[tuple[int, int, dict]],
         expected_segments: list[dict],
         response_message_id: int,
-    ) -> list[tuple[int, int, dict]]:
-        """从近期机器人消息中匹配本次发送的文本片段或媒体。"""
-        expected_text, expected_media = self._get_message_signature(expected_segments)
-        matched_media: dict[str, int] = {}
-        matched = []
+    ) -> tuple[list[tuple[int, int, dict]], str]:
+        """通过文本内容哈希和文件哈希，从近期历史中定位本次发送的消息。"""
+        (
+            expected_text,
+            expected_text_hash,
+            expected_text_hashes,
+            expected_file_hashes,
+            expected_media,
+        ) = self._get_message_signature(expected_segments)
+        ordered_messages = sorted(bot_messages, key=lambda item: item[0])
+        signatures = [
+            self._get_message_signature(message.get("message", []))
+            for _, _, message in ordered_messages
+        ]
+        response_index = next(
+            (
+                index
+                for index, item in enumerate(ordered_messages)
+                if item[1] == int(response_message_id)
+            ),
+            None,
+        )
 
-        # 先保留发送接口明确返回的 ID。该 ID 已兜底入队，不占用媒体匹配名额，
-        # 否则接口恰好返回图片消息时，历史中的拆分图片会被数量限制全部过滤。
-        for item in bot_messages:
-            _, message_id, message = item
-            if message_id != int(response_message_id):
-                continue
-            matched.append(item)
-            break
+        matched_by_id: dict[int, tuple[int, int, dict]] = {}
+        match_reasons: dict[int, set[str]] = {}
 
-        for item in bot_messages:
-            _, message_id, message = item
-            if message_id == int(response_message_id):
-                continue
+        def add_match(index: int, reason: str):
+            item = ordered_messages[index]
+            message_id = item[1]
+            matched_by_id[message_id] = item
+            match_reasons.setdefault(message_id, set()).add(reason)
 
-            candidate_text, candidate_media = self._get_message_signature(
-                message.get("message", [])
-            )
-            text_matches = bool(
-                candidate_text
-                and expected_text
-                and (
-                    candidate_text == expected_text
-                    or len(candidate_text) >= 4
-                    and candidate_text in expected_text
-                    or len(expected_text) >= 4
-                    and expected_text in candidate_text
+        if response_index is not None:
+            add_match(response_index, "接口返回ID")
+
+        # 先查找一段连续历史文本，其拼接内容哈希与完整待发送文本一致。
+        full_text_run = None
+        if expected_text and expected_text_hash:
+            matching_runs = []
+            for start in range(len(ordered_messages)):
+                combined_text = ""
+                for end in range(start, len(ordered_messages)):
+                    combined_text += signatures[end][0]
+                    if len(combined_text) > len(expected_text):
+                        break
+                    if not combined_text or len(combined_text) < len(expected_text):
+                        continue
+                    combined_hash = hashlib.sha256(
+                        combined_text.encode("utf-8")
+                    ).hexdigest()
+                    if combined_hash == expected_text_hash:
+                        matching_runs.append((start, end))
+                    break
+
+            if matching_runs:
+                anchor_index = (
+                    response_index
+                    if response_index is not None
+                    else len(ordered_messages) - 1
                 )
-            )
-            if text_matches:
-                matched.append(item)
-                for media_type, count in candidate_media.items():
-                    matched_media[media_type] = min(
-                        expected_media.get(media_type, 0),
-                        matched_media.get(media_type, 0) + count,
-                    )
-                continue
-
-            media_match = False
-            for media_type, count in candidate_media.items():
-                remaining = expected_media.get(media_type, 0) - matched_media.get(
-                    media_type, 0
+                full_text_run = min(
+                    matching_runs,
+                    key=lambda run: (
+                        0 if run[0] <= anchor_index <= run[1] else 1,
+                        abs(run[1] - anchor_index),
+                        run[1] - run[0],
+                    ),
                 )
-                if remaining > 0:
-                    matched_media[media_type] = matched_media.get(media_type, 0) + min(
-                        count, remaining
-                    )
-                    media_match = True
-            if media_match:
-                matched.append(item)
+                for index in range(full_text_run[0], full_text_run[1] + 1):
+                    add_match(index, "完整文本hash")
 
-        return matched
+        # 如果历史按原消息拆分，完整文本 hash 已覆盖全部文本；否则逐段按 hash 匹配。
+        if full_text_run is None and expected_text_hashes:
+            remaining_text_hashes = Counter(expected_text_hashes)
+            candidate_indexes = sorted(
+                range(len(ordered_messages)),
+                key=lambda index: (
+                    abs(index - response_index)
+                    if response_index is not None
+                    else len(ordered_messages) - 1 - index,
+                    -index,
+                ),
+            )
+            for index in candidate_indexes:
+                candidate_hashes = Counter(signatures[index][2])
+                candidate_text_hash = signatures[index][1]
+                if candidate_text_hash:
+                    candidate_hashes[candidate_text_hash] = max(
+                        candidate_hashes[candidate_text_hash], 1
+                    )
+                matched_hashes = []
+                for text_hash, count in candidate_hashes.items():
+                    matched_count = min(count, remaining_text_hashes[text_hash])
+                    if matched_count:
+                        remaining_text_hashes[text_hash] -= matched_count
+                        matched_hashes.append(text_hash[:12])
+                if matched_hashes:
+                    add_match(index, f"文本hash:{','.join(matched_hashes)}")
+
+        # 文件/图片只按显式文件哈希、内联文件内容哈希或稳定文件标识哈希关联。
+        if expected_file_hashes:
+            remaining_file_hashes = Counter(expected_file_hashes)
+            candidate_indexes = sorted(
+                range(len(ordered_messages)),
+                key=lambda index: (
+                    abs(index - response_index)
+                    if response_index is not None
+                    else len(ordered_messages) - 1 - index,
+                    -index,
+                ),
+            )
+            for index in candidate_indexes:
+                candidate_hashes = Counter(signatures[index][3])
+                matched_hashes = []
+                for file_hash, count in candidate_hashes.items():
+                    matched_count = min(count, remaining_file_hashes[file_hash])
+                    if matched_count:
+                        remaining_file_hashes[file_hash] -= matched_count
+                        matched_hashes.append(file_hash[:20])
+                if matched_hashes:
+                    add_match(index, f"文件hash:{','.join(matched_hashes)}")
+
+        matched = sorted(matched_by_id.values(), key=lambda item: item[0])
+        matched_log = []
+        for item in matched:
+            index = next(
+                (
+                    candidate_index
+                    for candidate_index, candidate in enumerate(ordered_messages)
+                    if candidate[1] == item[1]
+                ),
+                None,
+            )
+            if index is None:
+                continue
+            signature = signatures[index]
+            matched_log.append(
+                f"{item[1]}({','.join(sorted(match_reasons[item[1]]))};"
+                f"text={signature[1][:12] or '-'};"
+                f"file={[value[:20] for value in signature[3]]};"
+                f"内容={self._truncate_match_log(signature[0], 60)!r})"
+            )
+
+        candidate_log = []
+        for index in range(max(0, len(ordered_messages) - 10), len(ordered_messages)):
+            item = ordered_messages[index]
+            signature = signatures[index]
+            candidate_log.append(
+                f"{item[1]}(text={signature[1][:12] or '-'};"
+                f"file={[value[:20] for value in signature[3]]};"
+                f"内容={self._truncate_match_log(signature[0], 40)!r})"
+            )
+
+        debug = (
+            f"发送文本hash={expected_text_hash[:12] or '-'}，"
+            f"文本段hash={[value[:12] for value in expected_text_hashes]}，"
+            f"文件hash={[value[:20] for value in expected_file_hashes]}，"
+            f"媒体计数={expected_media}；连续全文匹配={full_text_run is not None}；"
+            f"命中={matched_log}；近期候选={candidate_log}"
+        )
+        return matched, self._truncate_match_log(debug, 1800)
 
     async def _queue_recent_bot_messages(
         self,
@@ -668,11 +877,12 @@ class BatchRecall(Star):
                 self.conf.get("enable_history_content_match", True)
             )
             if content_match_enabled:
-                bot_messages = self._match_current_send_history(
+                bot_messages, match_debug = self._match_current_send_history(
                     bot_candidates, expected_segments, response_message_id
                 )
             else:
                 bot_messages = bot_candidates
+                match_debug = "内容匹配关闭，使用时间窗口内全部机器人消息"
 
             added_count = 0
             # 先补录新消息，保持本地编号列表按时间倒序排列。
@@ -726,7 +936,7 @@ class BatchRecall(Star):
                 f"{'内容匹配' if content_match_enabled else '时间窗口'}筛选后 "
                 f"{len(bot_messages)} 条，ID {captured_ids[:20]}，扫描窗口 "
                 f"{self._get_history_scan_lookback_seconds()} 秒，"
-                f"发送媒体 {self._get_message_signature(expected_segments)[1]}；"
+                f"匹配详情：{match_debug}；"
                 f"新增入队 {added_count} 条"
             )
         except Exception as exc:
