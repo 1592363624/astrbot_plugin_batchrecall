@@ -26,6 +26,12 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 class BatchRecall(Star):
     """批量撤回插件主类"""
 
+    RECALL_ACTION_TIMEOUT = 10.0
+    RECALL_MAX_ATTEMPTS = 3
+    RETRYABLE_ACTION_RET_CODES = {-1, 1200, 1400}
+    HISTORY_PAGE_SIZE = 30
+    HISTORY_MAX_PAGES = 3
+
     def __init__(self, context: Context, config):
         super().__init__(context)
         self.conf = config
@@ -38,7 +44,9 @@ class BatchRecall(Star):
         self._no_auto_recall_windows: dict[str, list[tuple[int, int, float]]] = {}
         # 同一会话的撤回请求串行执行，避免短时间并发调用被协议端丢弃。
         self._recall_locks: dict[str, asyncio.Lock] = {}
+        self._recall_lock_users: dict[str, int] = {}
         self._last_recall_at: dict[str, float] = {}
+        self._last_state_prune = 0.0
         # 消息历史记录：{session_id: [(message_id, content_preview, timestamp, sender_id, sender_name, is_bot), ...]}
         # 最新消息在列表最前面，编号从1开始
         self.message_history: dict[str, list[tuple[int, str, int, str, str, bool]]] = {}
@@ -158,26 +166,58 @@ class BatchRecall(Star):
             return
         now = time.time()
         self._no_auto_recall_message_ids[(str(session_id), int(message_id))] = now + 30.0
-        if len(self._no_auto_recall_message_ids) > 512:
-            self._no_auto_recall_message_ids = {
-                key: expires_at
-                for key, expires_at in self._no_auto_recall_message_ids.items()
-                if expires_at > now
-            }
+        self._prune_expired_state()
 
     def _remember_no_auto_recall_window(
         self, session_id: str, started_at: float, finished_at: float
     ):
         """记录豁免发送的时间窗口，用来识别稍晚到达的拆分消息回显。"""
         session_id = str(session_id)
-        now = time.time()
-        windows = [
-            window
-            for window in self._no_auto_recall_windows.get(session_id, [])
-            if window[2] > now
-        ]
+        self._prune_expired_state()
+        windows = self._no_auto_recall_windows.get(session_id, [])
         windows.append((int(started_at), int(finished_at) + 1, finished_at + 30.0))
         self._no_auto_recall_windows[session_id] = windows[-32:]
+
+    def _prune_expired_state(self):
+        """统一淘汰自动撤回相关状态中的过期条目。"""
+        monotonic_now = time.monotonic()
+        if monotonic_now - self._last_state_prune < 30.0:
+            return
+
+        wall_now = time.time()
+        self._scheduled_recall_ids = {
+            key: expires_at
+            for key, expires_at in self._scheduled_recall_ids.items()
+            if expires_at > monotonic_now
+        }
+        self._no_auto_recall_message_ids = {
+            key: expires_at
+            for key, expires_at in self._no_auto_recall_message_ids.items()
+            if expires_at > wall_now
+        }
+        self._no_auto_recall_windows = {
+            session_id: active_windows
+            for session_id, windows in self._no_auto_recall_windows.items()
+            if (active_windows := [window for window in windows if window[2] > wall_now])
+        }
+
+        stale_keys = [
+            key
+            for key, last_used in self._last_recall_at.items()
+            if self._recall_lock_users.get(key, 0) == 0
+            and monotonic_now - last_used > 300.0
+        ]
+        stale_keys.extend(
+            key
+            for key in self._recall_locks
+            if key not in self._last_recall_at
+            and self._recall_lock_users.get(key, 0) == 0
+        )
+        for key in stale_keys:
+            self._recall_locks.pop(key, None)
+            self._last_recall_at.pop(key, None)
+
+        self._last_state_prune = monotonic_now
 
     def _is_no_auto_recall_message(
         self,
@@ -185,31 +225,30 @@ class BatchRecall(Star):
         message_id: Optional[int] = None,
         msg_time: Optional[int] = None,
     ) -> bool:
+        """只查询豁免状态；过期记录由独立清理函数回收。"""
         now = time.time()
         key = (str(session_id), int(message_id)) if message_id else None
-        if len(self._no_auto_recall_message_ids) > 512:
-            self._no_auto_recall_message_ids = {
-                item_key: expires_at
-                for item_key, expires_at in self._no_auto_recall_message_ids.items()
-                if expires_at > now
-            }
         if key and self._no_auto_recall_message_ids.get(key, 0.0) > now:
             return True
 
-        session_key = str(session_id)
-        windows = [
-            window
-            for window in self._no_auto_recall_windows.get(session_key, [])
-            if window[2] > now
-        ]
-        if windows:
-            self._no_auto_recall_windows[session_key] = windows
-        else:
-            self._no_auto_recall_windows.pop(session_key, None)
+        windows = self._no_auto_recall_windows.get(str(session_id), [])
         return bool(
             msg_time is not None
-            and any(start <= int(msg_time) <= end for start, end, _ in windows)
+            and any(
+                expires_at > now and start <= int(msg_time) <= end
+                for start, end, expires_at in windows
+            )
         )
+
+    def _release_recall_lock_user(self, lock_key: str):
+        """释放会话锁使用计数，并触发统一状态清理。"""
+        users = self._recall_lock_users.get(lock_key, 0)
+        if users <= 1:
+            self._recall_lock_users.pop(lock_key, None)
+        else:
+            self._recall_lock_users[lock_key] = users - 1
+
+        self._prune_expired_state()
 
     def _strip_command_prefix(self, text: str) -> str:
         """剥离开头的命令前缀符号（/、.、!、#等，包括中英文全半角符号），返回去除前缀后的文本"""
@@ -279,16 +318,11 @@ class BatchRecall(Star):
 
         message_id = int(message_id)
         session_id = str(session_id)
+        self._prune_expired_state()
         if self._is_no_auto_recall_message(session_id, message_id):
             return False
         recall_key = (session_id, message_id)
         now = time.monotonic()
-        if len(self._scheduled_recall_ids) % 128 == 0:
-            self._scheduled_recall_ids = {
-                key: expires_at
-                for key, expires_at in self._scheduled_recall_ids.items()
-                if expires_at > now
-            }
         if self._scheduled_recall_ids.get(recall_key, 0.0) > now:
             return False
 
@@ -296,7 +330,7 @@ class BatchRecall(Star):
         due_at = (scheduled_at if scheduled_at is not None else now) + recall_time
         self._scheduled_recall_ids[recall_key] = max(due_at + 5.0, now + 30.0)
         self._recall_queue.put_nowait((due_at, client, message_id, session_id))
-        logger.info(f"📥 消息 {message_id} 已加入自动撤回队列，队列长度: {self._recall_queue.qsize()}")
+        logger.debug(f"📥 消息 {message_id} 已加入自动撤回队列，队列长度: {self._recall_queue.qsize()}")
 
         if self._recall_worker is None or self._recall_worker.done():
             self._recall_worker = asyncio.create_task(self._process_recall_queue())
@@ -310,7 +344,7 @@ class BatchRecall(Star):
             due_at, client, message_id, session_id = await self._recall_queue.get()
             try:
                 delay = max(0.0, due_at - time.monotonic())
-                logger.info(f"⏰ 等待 {delay:.2f} 秒后撤回队列消息 {message_id}")
+                logger.debug(f"⏰ 等待 {delay:.2f} 秒后撤回队列消息 {message_id}")
                 await asyncio.sleep(delay)
                 await self._recall_msg(client, message_id, session_id)
             except asyncio.CancelledError:
@@ -327,12 +361,99 @@ class BatchRecall(Star):
             logger.info(f"✅ 已自动撤回消息: {message_id}")
             if session_id:
                 self._remove_message_from_history(session_id, message_id)
-        elif "已撤回" in err:
-            logger.info(f"撤回消息可能已超时或被撤回，message_id={message_id}: {err}")
-            if session_id:
-                self._remove_message_from_history(session_id, message_id)
         else:
             logger.error(f"撤回消息失败，message_id={message_id}: {err}")
+
+    async def _fetch_recent_history_messages(
+        self,
+        event: AiocqhttpMessageEvent,
+        session_id: str,
+        is_group: bool,
+        sent_at: float,
+    ) -> list[dict]:
+        """获取本次发送时刻之后的有限页历史，控制每次发送的 API 负载。"""
+        action = "get_group_msg_history" if is_group else "get_friend_msg_history"
+        peer_key = "group_id" if is_group else "user_id"
+        request = {
+            peer_key: int(session_id),
+            "count": self.HISTORY_PAGE_SIZE,
+        }
+        result = await event.bot.call_action(action, **request)
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        if not isinstance(messages, list):
+            return []
+        messages = [message for message in messages if isinstance(message, dict)]
+
+        # OneBot 时间戳只有秒级精度，因此同一秒内的消息都视为本次发送后的候选。
+        cutoff = int(sent_at)
+        seen_ids = {
+            int(message["message_id"])
+            for message in messages
+            if message.get("message_id")
+        }
+        seen_cursors = set()
+        page = messages
+        page_count = 1
+        while (
+            len(page) >= self.HISTORY_PAGE_SIZE
+            and page_count < self.HISTORY_MAX_PAGES
+        ):
+            oldest = min(
+                page,
+                key=lambda message: int(message.get("time", 0) or 0),
+                default=None,
+            )
+            if not oldest or int(oldest.get("time", 0) or 0) < cutoff:
+                break
+            cursor = oldest.get("message_seq") or oldest.get("message_id")
+            if not cursor or str(cursor) in seen_cursors:
+                break
+            seen_cursors.add(str(cursor))
+            try:
+                page_result = await event.bot.call_action(
+                    action,
+                    **{
+                        peer_key: int(session_id),
+                        "message_seq": cursor,
+                        "count": self.HISTORY_PAGE_SIZE,
+                        "reverseOrder": True,
+                    },
+                )
+            except Exception as exc:
+                logger.debug(f"{action} 不支持向前翻页或游标查询失败: {exc}")
+                break
+
+            page = (
+                page_result.get("messages", [])
+                if isinstance(page_result, dict)
+                else []
+            )
+            if not isinstance(page, list):
+                break
+            page = [message for message in page if isinstance(message, dict)]
+            new_messages = []
+            for message in page:
+                message_id = message.get("message_id")
+                if not message_id:
+                    continue
+                message_id = int(message_id)
+                if message_id not in seen_ids:
+                    seen_ids.add(message_id)
+                    new_messages.append(message)
+            if not new_messages:
+                break
+            messages.extend(new_messages)
+            page_count += 1
+
+        if page_count >= self.HISTORY_MAX_PAGES and len(page) >= self.HISTORY_PAGE_SIZE:
+            logger.debug(
+                f"{action} 已达到历史分页上限 {self.HISTORY_MAX_PAGES}，停止继续读取"
+            )
+        return [
+            message
+            for message in messages
+            if int(message.get("time", 0) or 0) >= cutoff
+        ]
 
     async def _queue_recent_bot_messages(
         self,
@@ -342,106 +463,35 @@ class BatchRecall(Star):
         sent_at: float,
         scheduled_at: Optional[float] = None,
     ):
-        """从近期会话历史中找出本次发送对应的所有实际消息ID。"""
+        """将发送时刻之后的机器人历史消息补录并加入自动撤回队列。"""
         try:
+            self._prune_expired_state()
             is_group = bool(event.get_group_id())
-            action = "get_group_msg_history" if is_group else "get_friend_msg_history"
-            peer_key = "group_id" if is_group else "user_id"
-            request = {peer_key: int(session_id), "count": 100}
-            result = await event.bot.call_action(action, **request)
-            messages = result.get("messages", []) if isinstance(result, dict) else []
-            if not isinstance(messages, list):
-                messages = []
-            else:
-                messages = [message for message in messages if isinstance(message, dict)]
-
-            # 如果最近100条仍全部落在窗口内，使用历史游标继续向前翻页。
-            # 部分 OneBot 实现不支持游标参数；这时保留已取到的记录并继续兜底。
-            cutoff = int(sent_at) - 10
-            seen_ids = {
-                int(message["message_id"])
-                for message in messages
-                if isinstance(message, dict) and message.get("message_id")
-            }
-            seen_cursors = set()
-            page = messages
-            while len(page) >= 100:
-                oldest = min(
-                    page,
-                    key=lambda message: int(message.get("time", 0) or 0),
-                    default=None,
-                )
-                if not oldest or int(oldest.get("time", 0) or 0) < cutoff:
-                    break
-                cursor = oldest.get("message_seq") or oldest.get("message_id")
-                if not cursor or str(cursor) in seen_cursors:
-                    break
-                seen_cursors.add(str(cursor))
-                try:
-                    page_result = await event.bot.call_action(
-                        action,
-                        **{
-                            peer_key: int(session_id),
-                            "message_seq": cursor,
-                            "count": 100,
-                            "reverseOrder": True,
-                        },
-                    )
-                except Exception as exc:
-                    logger.debug(f"{action} 不支持向前翻页或游标查询失败: {exc}")
-                    break
-
-                page = (
-                    page_result.get("messages", [])
-                    if isinstance(page_result, dict)
-                    else []
-                )
-                if not isinstance(page, list):
-                    break
-                page = [message for message in page if isinstance(message, dict)]
-                new_messages = []
-                for message in page:
-                    message_id = message.get("message_id") if isinstance(message, dict) else None
-                    if not message_id:
-                        continue
-                    message_id = int(message_id)
-                    if message_id not in seen_ids:
-                        seen_ids.add(message_id)
-                        new_messages.append(message)
-                if not new_messages:
-                    break
-                messages.extend(new_messages)
-
+            messages = await self._fetch_recent_history_messages(
+                event, session_id, is_group, sent_at
+            )
             bot_messages = []
-            recent_bot_ids = []
             for message in messages:
                 sender_id = str(message.get("sender", {}).get("user_id", ""))
-                if sender_id != bot_self_id:
-                    continue
-
                 message_id = message.get("message_id")
-                if not message_id:
+                if sender_id != bot_self_id or not message_id:
                     continue
                 msg_time = int(message.get("time", 0) or 0)
-                # OneBot 时间戳只有秒级精度，保留发送前10秒的机器人消息。
-                if msg_time < cutoff:
-                    continue
-                recent_bot_ids.append(int(message_id))
                 bot_messages.append((msg_time, int(message_id), message))
 
             added_count = 0
-            # 从最新到最旧补录；历史插入会按时间倒序定位，保留已记录的最近消息在前。
+            # 先补录新消息，保持本地编号列表按时间倒序排列。
             for msg_time, message_id, message in sorted(
                 bot_messages, key=lambda item: item[0], reverse=True
             ):
                 sender_info = message.get("sender", {})
                 raw_message = message.get("message", [])
-                if isinstance(raw_message, list):
-                    content = self._extract_message_content_from_segments(raw_message)
-                else:
-                    content = str(raw_message)[:50]
+                content = (
+                    self._extract_message_content_from_segments(raw_message)
+                    if isinstance(raw_message, list)
+                    else str(raw_message)[:50]
+                )
                 sender_name = sender_info.get("card") or sender_info.get("nickname", "机器人")
-
                 self._add_message_to_history(
                     session_id,
                     message_id,
@@ -468,9 +518,8 @@ class BatchRecall(Star):
                     bot_messages, key=lambda item: item[0], reverse=True
                 )
             ]
-            logger.info(
-                f"📥 {'群' if is_group else '私聊'}历史近10秒机器人消息ID: {recent_bot_ids}；"
-                f"历史记录顺序（新到旧）: {captured_ids}；"
+            logger.debug(
+                f"{'群' if is_group else '私聊'}本次发送后机器人消息ID: {captured_ids}；"
                 f"新增入队 {added_count} 条"
             )
         except Exception as exc:
@@ -537,7 +586,8 @@ class BatchRecall(Star):
                     return
                 session_id = self._get_session_id(event)
                 ok, err = await self._do_recall(event.bot, reply_id, session_id)
-                self._remove_message_from_history(session_id, reply_id)
+                if ok:
+                    self._remove_message_from_history(session_id, reply_id)
                 if self.conf.get("enable_recall_notification", True):
                     self._mark_no_auto_recall()
                     if ok:
@@ -636,18 +686,22 @@ class BatchRecall(Star):
                 self._reserve_no_auto_recall_echo(session_id)
                 pending_no_auto_reserved = True
 
-            if is_group:
-                send_result = await event.bot.call_action(
-                    "send_group_msg",
-                    group_id=int(session_id),
-                    message=onebot_messages,
-                )
-            else:
-                send_result = await event.bot.call_action(
-                    "send_private_msg",
-                    user_id=int(session_id),
-                    message=onebot_messages,
-                )
+            try:
+                if is_group:
+                    send_result = await event.bot.call_action(
+                        "send_group_msg",
+                        group_id=int(session_id),
+                        message=onebot_messages,
+                    )
+                else:
+                    send_result = await event.bot.call_action(
+                        "send_private_msg",
+                        user_id=int(session_id),
+                        message=onebot_messages,
+                    )
+            except Exception as send_exc:
+                logger.error(f"发送消息失败: {send_exc}")
+                return
 
             message_id = None
             if isinstance(send_result, dict):
@@ -709,47 +763,57 @@ class BatchRecall(Star):
         message_id: int,
         session_id: Optional[str] = None,
     ) -> tuple[bool, str]:
-        """串行执行并短暂重试撤回，返回(是否成功，错误信息)。"""
+        """串行执行有超时保护的撤回，并只对可重试错误短暂重试。"""
         if not message_id:
             return False, "无效的消息ID"
 
         lock_key = str(session_id) if session_id is not None else "__default__"
         lock = self._recall_locks.setdefault(lock_key, asyncio.Lock())
+        self._recall_lock_users[lock_key] = self._recall_lock_users.get(lock_key, 0) + 1
 
-        async with lock:
-            # 每个会话的删除请求间隔少量时间，避免协议端在密集请求时漏处理。
-            previous_result_ambiguous = False
-            error = "撤回失败"
-            for attempt in range(3):
-                elapsed = time.monotonic() - self._last_recall_at.get(lock_key, 0.0)
-                if elapsed < 0.2:
-                    await asyncio.sleep(0.2 - elapsed)
-                self._last_recall_at[lock_key] = time.monotonic()
+        try:
+            async with lock:
+                # 每个会话的删除请求间隔少量时间，避免协议端在密集请求时漏处理。
+                error = "撤回失败"
+                for attempt in range(self.RECALL_MAX_ATTEMPTS):
+                    elapsed = time.monotonic() - self._last_recall_at.get(lock_key, 0.0)
+                    if elapsed < 0.2:
+                        await asyncio.sleep(0.2 - elapsed)
+                    self._last_recall_at[lock_key] = time.monotonic()
 
-                try:
-                    await bot.delete_msg(message_id=int(message_id))
-                    return True, ""
-                except ActionFailed as e:
-                    if getattr(e, "retcode", None) == 1200:
-                        if previous_result_ambiguous:
-                            return True, "消息已不存在，前一次撤回请求结果不确定"
-                        return False, "消息已撤回或超时"
-                    return False, f"撤回失败(retcode={getattr(e, 'retcode', '未知')})"
-                except (asyncio.TimeoutError, ConnectionError, OSError) as e:
-                    error = f"撤回请求结果不确定: {str(e)}"
-                    previous_result_ambiguous = True
-                except Exception as e:
-                    return False, f"撤回失败: {str(e)}"
+                    try:
+                        await asyncio.wait_for(
+                            bot.delete_msg(message_id=int(message_id)),
+                            timeout=self.RECALL_ACTION_TIMEOUT,
+                        )
+                        return True, ""
+                    except ActionFailed as e:
+                        raw_retcode = getattr(e, "retcode", None)
+                        try:
+                            retcode = int(raw_retcode)
+                        except (TypeError, ValueError):
+                            retcode = None
+                        error = f"撤回失败(retcode={raw_retcode if raw_retcode is not None else '未知'})"
+                        if retcode not in self.RETRYABLE_ACTION_RET_CODES:
+                            return False, error
+                    except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                        error = f"撤回请求超时或连接失败: {e}"
+                    except Exception as e:
+                        return False, f"撤回失败: {e}"
 
-                if attempt < 2:
-                    delay = 0.3 * (attempt + 1)
-                    logger.warning(
-                        f"撤回消息 {message_id} 失败，{delay:.1f} 秒后重试 "
-                        f"({attempt + 1}/2): {error}"
-                    )
-                    await asyncio.sleep(delay)
+                    if attempt + 1 < self.RECALL_MAX_ATTEMPTS:
+                        delay = 0.3 * (attempt + 1)
+                        logger.warning(
+                            f"撤回消息 {message_id} 失败，{delay:.1f} 秒后重试 "
+                            f"({attempt + 1}/{self.RECALL_MAX_ATTEMPTS - 1}): {error}"
+                        )
+                        await asyncio.sleep(delay)
 
-            return False, error
+                if "retcode=1200" in error:
+                    error += "；消息可能已撤回或仍存在，本地历史记录已保留"
+                return False, error
+        finally:
+            self._release_recall_lock_user(lock_key)
 
     @filter.command("test_recall")
     async def test_recall_command(self, event: AstrMessageEvent):
@@ -787,6 +851,9 @@ class BatchRecall(Star):
         self._pending_no_auto_recall_sessions.clear()
         self._no_auto_recall_message_ids.clear()
         self._no_auto_recall_windows.clear()
+        self._recall_locks.clear()
+        self._recall_lock_users.clear()
+        self._last_recall_at.clear()
         logger.info("批量撤回插件已卸载")
 
     async def _load_history_from_api(self, event: AiocqhttpMessageEvent, session_id: str):
@@ -1038,10 +1105,7 @@ class BatchRecall(Star):
                 success += 1
                 self._remove_message_from_history(session_id, message_id)
             else:
-                if "已撤回" not in err:
-                    failed_msgs.append(f"{message_id}({err})")
-                else:
-                    self._remove_message_from_history(session_id, message_id)
+                failed_msgs.append(f"{message_id}({err})")
 
         if self.conf.get("enable_recall_notification", True):
             result_text = f"已尝试撤回机器人最近 {success} 条消息。"
@@ -1130,7 +1194,8 @@ class BatchRecall(Star):
         # 有引用消息时优先处理引用撤回
         if reply_id:
             ok, err = await self._do_recall(event.bot, reply_id, session_id)
-            self._remove_message_from_history(session_id, reply_id)
+            if ok:
+                self._remove_message_from_history(session_id, reply_id)
             if self.conf.get("enable_recall_notification", True):
                 self._mark_no_auto_recall()
                 if ok:
@@ -1232,10 +1297,7 @@ class BatchRecall(Star):
                     success += 1
                     self._remove_message_from_history(session_id, message_id)
                 else:
-                    if "已撤回" not in err:
-                        failed_msgs.append(f"{message_id}({err})")
-                    else:
-                        self._remove_message_from_history(session_id, message_id)
+                    failed_msgs.append(f"{message_id}({err})")
 
             if self.conf.get("enable_recall_notification", True):
                 result_text = f"已尝试撤回最近 {success} 条消息。"
@@ -1273,10 +1335,7 @@ class BatchRecall(Star):
                             success += 1
                             self._remove_message_from_history(session_id, msg_id)
                         else:
-                            if "已撤回" not in err:
-                                failed_msgs.append(f"[{num}]{err}")
-                            else:
-                                self._remove_message_from_history(session_id, msg_id)
+                            failed_msgs.append(f"[{num}]{err}")
                     else:
                         invalid_nums.append(str(num))
 
@@ -1316,10 +1375,7 @@ class BatchRecall(Star):
                         success += 1
                         self._remove_message_from_history(session_id, msg_id)
                     else:
-                        if "已撤回" not in err:
-                            failed_msgs.append(f"[{num}]{err}")
-                        else:
-                            self._remove_message_from_history(session_id, msg_id)
+                        failed_msgs.append(f"[{num}]{err}")
                 else:
                     invalid_nums.append(str(num))
 
@@ -1371,7 +1427,8 @@ class BatchRecall(Star):
 
         session_id = self._get_session_id(event)
         ok, err = await self._do_recall(event.bot, reply_id, session_id)
-        self._remove_message_from_history(session_id, reply_id)
+        if ok:
+            self._remove_message_from_history(session_id, reply_id)
 
         if self.conf.get("enable_recall_notification", True):
             self._mark_no_auto_recall()
