@@ -476,36 +476,99 @@ class BatchRecall(Star):
 
     def _get_message_signature(self, message) -> tuple[str, dict[str, int]]:
         """提取消息文本和可匹配媒体类型，用于关联本次发送的拆分消息。"""
-        if isinstance(message, list):
-            segments = message
-            raw_text = ""
-        elif isinstance(message, str):
-            segments = []
-            raw_text = message
-        else:
-            segments = []
-            raw_text = ""
-
         text_parts = []
         media_counts: dict[str, int] = {}
-        matchable_media = {"image", "record", "video", "file", "face", "mface"}
-        for segment in segments:
-            if not isinstance(segment, dict):
-                continue
-            segment_type = segment.get("type")
-            if segment_type == "text":
-                data = segment.get("data", {})
-                if isinstance(data, dict):
-                    text_parts.append(str(data.get("text", "")))
-            elif segment_type in matchable_media:
-                media_counts[segment_type] = media_counts.get(segment_type, 0) + 1
 
-        if raw_text:
-            for segment_type in re.findall(r"\[CQ:([a-zA-Z0-9_]+)", raw_text):
-                if segment_type in matchable_media:
-                    media_counts[segment_type] = media_counts.get(segment_type, 0) + 1
-            raw_text = re.sub(r"\[CQ:[^\]]+\]", "", raw_text)
+        def canonical_media_type(segment_type: str) -> Optional[str]:
+            # 不同 OneBot 实现和 AstrBot 组件可能使用大小写、下划线或
+            # Segment 类名等不同写法，先统一格式再映射到媒体类别。
+            segment_type = re.sub(r"[^a-z0-9]", "", segment_type.casefold())
+            if segment_type in {
+                "image", "imagesegment", "img", "pic", "picture",
+                "flash", "flashimage", "flashimagesegment", "mface",
+            }:
+                return "image"
+            if segment_type in {"record", "recordsegment", "audio", "audiosegment"}:
+                return "record"
+            if segment_type in {"video", "videosegment", "shortvideo"}:
+                return "video"
+            if segment_type in {"file", "filesegment", "attachment"}:
+                return "file"
+            if segment_type in {"face", "facesegment", "emoji", "emoticon"}:
+                return "face"
+            return None
+
+        def add_raw_text(raw_text: str):
+            for raw_segment_type in re.findall(
+                r"\[CQ:([a-zA-Z0-9_]+)", raw_text, flags=re.IGNORECASE
+            ):
+                media_type = canonical_media_type(raw_segment_type)
+                if media_type:
+                    media_counts[media_type] = media_counts.get(media_type, 0) + 1
+            # 某些历史接口会把无法还原的图片段折叠成可读占位符，而不是
+            # 返回 OneBot image segment 或 CQ 码。
+            image_placeholders = re.findall(
+                r"\[(?:图片|image|img|pic|photo)\]|【图片】",
+                raw_text,
+                flags=re.IGNORECASE,
+            )
+            if image_placeholders:
+                media_counts["image"] = media_counts.get("image", 0) + len(
+                    image_placeholders
+                )
+            raw_text = re.sub(r"\[CQ:[^\]]+\]", "", raw_text, flags=re.IGNORECASE)
+            raw_text = re.sub(
+                r"\[(?:图片|image|img|pic|photo)\]|【图片】",
+                "",
+                raw_text,
+                flags=re.IGNORECASE,
+            )
             text_parts.append(raw_text)
+
+        def visit_segments(value):
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    visit_segments(item)
+                return
+            if isinstance(value, str):
+                add_raw_text(value)
+                return
+            if not isinstance(value, dict):
+                return
+
+            segment_type = str(value.get("type", "")).rsplit(".", 1)[-1].lower()
+            data = value.get("data", {})
+            if segment_type == "text":
+                text = data.get("text", "") if isinstance(data, dict) else ""
+                add_raw_text(str(text))
+                return
+
+            media_type = canonical_media_type(segment_type)
+            if media_type:
+                media_counts[media_type] = media_counts.get(media_type, 0) + 1
+                return
+
+            # 转发、合并转发和部分适配器的历史记录会把真实消息段嵌套在
+            # message/content/segments 等字段下；同时兼容无 type 的包装对象。
+            nested_keys = (
+                "content", "message", "message_chain", "chain", "segments",
+                "nodes", "elements", "children", "items",
+            )
+            for container in (value, data):
+                if isinstance(container, dict):
+                    for key in nested_keys:
+                        if key in container:
+                            visit_segments(container[key])
+                elif isinstance(container, (list, tuple)):
+                    visit_segments(container)
+                elif isinstance(container, str) and re.search(
+                    r"\[CQ:|\[(?:图片|image|img|pic|photo)\]|【图片】",
+                    container,
+                    flags=re.IGNORECASE,
+                ):
+                    visit_segments(container)
+
+        visit_segments(message)
 
         normalized_text = re.sub(r"\s+", "", "".join(text_parts)).casefold()
         return normalized_text, media_counts
@@ -521,17 +584,13 @@ class BatchRecall(Star):
         matched_media: dict[str, int] = {}
         matched = []
 
-        # 先保留发送接口明确返回的 ID，并扣除其中已匹配到的媒体数量。
+        # 先保留发送接口明确返回的 ID。该 ID 已兜底入队，不占用媒体匹配名额，
+        # 否则接口恰好返回图片消息时，历史中的拆分图片会被数量限制全部过滤。
         for item in bot_messages:
             _, message_id, message = item
             if message_id != int(response_message_id):
                 continue
             matched.append(item)
-            _, media_counts = self._get_message_signature(message.get("message", []))
-            for media_type, count in media_counts.items():
-                matched_media[media_type] = min(
-                    expected_media.get(media_type, 0), count
-                )
             break
 
         for item in bot_messages:
@@ -666,7 +725,8 @@ class BatchRecall(Star):
                 f"机器人候选 {len(bot_candidates)} 条，候选ID {candidate_ids[:20]}，"
                 f"{'内容匹配' if content_match_enabled else '时间窗口'}筛选后 "
                 f"{len(bot_messages)} 条，ID {captured_ids[:20]}，扫描窗口 "
-                f"{self._get_history_scan_lookback_seconds()} 秒；"
+                f"{self._get_history_scan_lookback_seconds()} 秒，"
+                f"发送媒体 {self._get_message_signature(expected_segments)[1]}；"
                 f"新增入队 {added_count} 条"
             )
         except Exception as exc:
