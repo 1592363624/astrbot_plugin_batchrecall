@@ -31,8 +31,8 @@ class BatchRecall(Star):
     RETRYABLE_ACTION_RET_CODES = {-1, 1200, 1400}
     HISTORY_PAGE_SIZE = 30
     HISTORY_MAX_PAGES = 3
-    HISTORY_CLOCK_SKEW_TOLERANCE = 2
-    HISTORY_SETTLE_DELAY = 0.3
+    HISTORY_SCAN_LOOKBACK_SECONDS = 10
+    HISTORY_SETTLE_DELAY = 0.5
 
     def __init__(self, context: Context, config):
         super().__init__(context)
@@ -372,7 +372,7 @@ class BatchRecall(Star):
         session_id: str,
         is_group: bool,
         sent_at: float,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], int]:
         """获取本次发送附近的有限页历史，控制每次发送的 API 负载。"""
         action = "get_group_msg_history" if is_group else "get_friend_msg_history"
         peer_key = "group_id" if is_group else "user_id"
@@ -383,10 +383,10 @@ class BatchRecall(Star):
         result = await event.bot.call_action(action, **request)
         messages = result.get("messages", []) if isinstance(result, dict) else []
         if not isinstance(messages, list):
-            return []
+            return [], 0
         messages = [message for message in messages if isinstance(message, dict)]
 
-        # OneBot 时间戳只有秒级精度，并给协议端与 AstrBot 的时钟留可配置容差。
+        # 回看最近配置的时间窗口，以覆盖拆分消息和协议端历史写入延迟。
         cutoff = int(sent_at) - self._get_history_scan_lookback_seconds()
         seen_ids = {
             int(message["message_id"])
@@ -451,24 +451,28 @@ class BatchRecall(Star):
             logger.debug(
                 f"{action} 已达到历史分页上限 {self.HISTORY_MAX_PAGES}，停止继续读取"
             )
-        return [
-            message
-            for message in messages
-            if int(message.get("time", 0) or 0) >= cutoff
-        ]
+        api_message_count = len(messages)
+        return (
+            [
+                message
+                for message in messages
+                if int(message.get("time", 0) or 0) >= cutoff
+            ],
+            api_message_count,
+        )
 
     def _get_history_scan_lookback_seconds(self) -> int:
-        """返回历史扫描容差，并限制配置范围以控制误匹配窗口。"""
+        """返回历史扫描回看秒数，并限制配置范围以控制误匹配窗口。"""
         try:
             seconds = int(
                 self.conf.get(
                     "history_scan_lookback_seconds",
-                    self.HISTORY_CLOCK_SKEW_TOLERANCE,
+                    self.HISTORY_SCAN_LOOKBACK_SECONDS,
                 )
             )
         except (TypeError, ValueError):
-            seconds = self.HISTORY_CLOCK_SKEW_TOLERANCE
-        return max(0, min(seconds, 5))
+            seconds = self.HISTORY_SCAN_LOOKBACK_SECONDS
+        return max(0, min(seconds, 10))
 
     async def _queue_recent_bot_messages(
         self,
@@ -478,13 +482,13 @@ class BatchRecall(Star):
         sent_at: float,
         scheduled_at: Optional[float] = None,
     ):
-        """将发送时刻之后的机器人历史消息补录并加入自动撤回队列。"""
+        """将发送时刻附近的机器人历史消息补录并加入自动撤回队列。"""
         try:
             self._prune_expired_state()
             # 部分协议端在 send_* 返回后才异步写入拆分消息的历史记录。
             await asyncio.sleep(self.HISTORY_SETTLE_DELAY)
             is_group = bool(event.get_group_id())
-            messages = await self._fetch_recent_history_messages(
+            messages, api_message_count = await self._fetch_recent_history_messages(
                 event, session_id, is_group, sent_at
             )
             bot_messages = []
@@ -536,9 +540,10 @@ class BatchRecall(Star):
                 )
             ]
             logger.info(
-                f"📥 {'群' if is_group else '私聊'}历史补录完成：历史记录 {len(messages)} 条，"
+                f"📥 {'群' if is_group else '私聊'}历史补录完成：API返回 {api_message_count} 条，"
+                f"窗口内 {len(messages)} 条，"
                 f"机器人消息候选 {len(bot_messages)} 条，候选ID {captured_ids[:20]}，"
-                f"发送前容差 {self._get_history_scan_lookback_seconds()} 秒；"
+                f"发送前扫描 {self._get_history_scan_lookback_seconds()} 秒；"
                 f"新增入队 {added_count} 条"
             )
         except Exception as exc:
