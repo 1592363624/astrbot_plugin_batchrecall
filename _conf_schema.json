@@ -50,7 +50,7 @@
     "history_scan_lookback_seconds": {
         "description": "历史消息扫描回看秒数",
         "type": "int",
-        "hint": "发送后历史补录的时间窗口，范围0到15秒；消息还需是发送前 ID 快照中不存在的机器人消息",
+        "hint": "历史补录按本次发送内容和媒体类型匹配，扫描窗口范围0到15秒",
         "default": 15
     }
 }

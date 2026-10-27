@@ -33,7 +33,6 @@ class BatchRecall(Star):
     HISTORY_MAX_PAGES = 3
     HISTORY_SCAN_LOOKBACK_SECONDS = 15
     HISTORY_SETTLE_DELAY = 0.5
-    HISTORY_SNAPSHOT_TIMEOUT = 1.0
 
     def __init__(self, context: Context, config):
         super().__init__(context)
@@ -367,54 +366,14 @@ class BatchRecall(Star):
         else:
             logger.error(f"撤回消息失败，message_id={message_id}: {err}")
 
-    async def _capture_history_message_ids(
-        self,
-        event: AiocqhttpMessageEvent,
-        session_id: str,
-        is_group: bool,
-    ) -> Optional[set[int]]:
-        """在插件发送前记录最近消息 ID，供发送后做差集。"""
-        action = "get_group_msg_history" if is_group else "get_friend_msg_history"
-        peer_key = "group_id" if is_group else "user_id"
-        try:
-            result = await asyncio.wait_for(
-                event.bot.call_action(
-                    action,
-                    **{
-                        peer_key: int(session_id),
-                        "count": self.HISTORY_PAGE_SIZE,
-                    },
-                ),
-                timeout=self.HISTORY_SNAPSHOT_TIMEOUT,
-            )
-        except Exception as exc:
-            logger.warning(f"发送前获取历史消息快照失败，将只安排发送接口返回的消息ID: {exc}")
-            return None
-
-        messages = result.get("messages", []) if isinstance(result, dict) else None
-        if not isinstance(messages, list):
-            logger.warning("发送前历史消息快照格式无效，将只安排发送接口返回的消息ID")
-            return None
-
-        message_ids = set()
-        for message in messages:
-            if not isinstance(message, dict) or not message.get("message_id"):
-                continue
-            try:
-                message_ids.add(int(message["message_id"]))
-            except (TypeError, ValueError):
-                continue
-        return message_ids
-
     async def _fetch_recent_history_messages(
         self,
         event: AiocqhttpMessageEvent,
         session_id: str,
         is_group: bool,
         sent_at: float,
-        baseline_message_ids: set[int],
     ) -> tuple[list[dict], int]:
-        """获取发送后新增的有限页历史，控制每次发送的 API 负载。"""
+        """获取本次发送附近的有限页历史，控制每次发送的 API 负载。"""
         action = "get_group_msg_history" if is_group else "get_friend_msg_history"
         peer_key = "group_id" if is_group else "user_id"
         request = {
@@ -437,15 +396,9 @@ class BatchRecall(Star):
         seen_cursors = set()
         page = messages
         page_count = 1
-        baseline_reached = any(
-            message.get("message_id")
-            and int(message["message_id"]) in baseline_message_ids
-            for message in page
-        )
         while (
             len(page) >= self.HISTORY_PAGE_SIZE
             and page_count < self.HISTORY_MAX_PAGES
-            and not baseline_reached
         ):
             oldest = min(
                 page,
@@ -493,11 +446,6 @@ class BatchRecall(Star):
                 break
             messages.extend(new_messages)
             page_count += 1
-            baseline_reached = any(
-                message.get("message_id")
-                and int(message["message_id"]) in baseline_message_ids
-                for message in page
-            )
 
         if page_count >= self.HISTORY_MAX_PAGES and len(page) >= self.HISTORY_PAGE_SIZE:
             logger.debug(
@@ -508,9 +456,7 @@ class BatchRecall(Star):
             [
                 message
                 for message in messages
-                if message.get("message_id")
-                and int(message["message_id"]) not in baseline_message_ids
-                and int(message.get("time", 0) or 0) >= cutoff
+                if int(message.get("time", 0) or 0) >= cutoff
             ],
             api_message_count,
         )
@@ -528,36 +474,140 @@ class BatchRecall(Star):
             seconds = self.HISTORY_SCAN_LOOKBACK_SECONDS
         return max(0, min(seconds, 15))
 
+    def _get_message_signature(self, message) -> tuple[str, dict[str, int]]:
+        """提取消息文本和可匹配媒体类型，用于关联本次发送的拆分消息。"""
+        if isinstance(message, list):
+            segments = message
+            raw_text = ""
+        elif isinstance(message, str):
+            segments = []
+            raw_text = message
+        else:
+            segments = []
+            raw_text = ""
+
+        text_parts = []
+        media_counts: dict[str, int] = {}
+        matchable_media = {"image", "record", "video", "file", "face", "mface"}
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            segment_type = segment.get("type")
+            if segment_type == "text":
+                data = segment.get("data", {})
+                if isinstance(data, dict):
+                    text_parts.append(str(data.get("text", "")))
+            elif segment_type in matchable_media:
+                media_counts[segment_type] = media_counts.get(segment_type, 0) + 1
+
+        if raw_text:
+            for segment_type in re.findall(r"\[CQ:([a-zA-Z0-9_]+)", raw_text):
+                if segment_type in matchable_media:
+                    media_counts[segment_type] = media_counts.get(segment_type, 0) + 1
+            raw_text = re.sub(r"\[CQ:[^\]]+\]", "", raw_text)
+            text_parts.append(raw_text)
+
+        normalized_text = re.sub(r"\s+", "", "".join(text_parts)).casefold()
+        return normalized_text, media_counts
+
+    def _match_current_send_history(
+        self,
+        bot_messages: list[tuple[int, int, dict]],
+        expected_segments: list[dict],
+        response_message_id: int,
+    ) -> list[tuple[int, int, dict]]:
+        """从近期机器人消息中匹配本次发送的文本片段或媒体。"""
+        expected_text, expected_media = self._get_message_signature(expected_segments)
+        matched_media: dict[str, int] = {}
+        matched = []
+
+        # 先保留发送接口明确返回的 ID，并扣除其中已匹配到的媒体数量。
+        for item in bot_messages:
+            _, message_id, message = item
+            if message_id != int(response_message_id):
+                continue
+            matched.append(item)
+            _, media_counts = self._get_message_signature(message.get("message", []))
+            for media_type, count in media_counts.items():
+                matched_media[media_type] = min(
+                    expected_media.get(media_type, 0), count
+                )
+            break
+
+        for item in bot_messages:
+            _, message_id, message = item
+            if message_id == int(response_message_id):
+                continue
+
+            candidate_text, candidate_media = self._get_message_signature(
+                message.get("message", [])
+            )
+            text_matches = bool(
+                candidate_text
+                and expected_text
+                and (
+                    candidate_text == expected_text
+                    or len(candidate_text) >= 4
+                    and candidate_text in expected_text
+                    or len(expected_text) >= 4
+                    and expected_text in candidate_text
+                )
+            )
+            if text_matches:
+                matched.append(item)
+                for media_type, count in candidate_media.items():
+                    matched_media[media_type] = min(
+                        expected_media.get(media_type, 0),
+                        matched_media.get(media_type, 0) + count,
+                    )
+                continue
+
+            media_match = False
+            for media_type, count in candidate_media.items():
+                remaining = expected_media.get(media_type, 0) - matched_media.get(
+                    media_type, 0
+                )
+                if remaining > 0:
+                    matched_media[media_type] = matched_media.get(media_type, 0) + min(
+                        count, remaining
+                    )
+                    media_match = True
+            if media_match:
+                matched.append(item)
+
+        return matched
+
     async def _queue_recent_bot_messages(
         self,
         event: AiocqhttpMessageEvent,
         session_id: str,
         bot_self_id: str,
         sent_at: float,
-        baseline_message_ids: Optional[set[int]],
+        expected_segments: list[dict],
+        response_message_id: int,
         scheduled_at: Optional[float] = None,
     ):
-        """将本次发送后新增的机器人历史消息补录并加入自动撤回队列。"""
+        """匹配并补录本次发送对应的机器人历史消息。"""
         try:
             self._prune_expired_state()
-            if baseline_message_ids is None:
-                # 没有可靠发送前边界时不按时间盲扫，避免撤回其他插件的消息。
-                logger.warning("跳过历史消息补录：发送前历史快照不可用")
-                return
             # 部分协议端在 send_* 返回后才异步写入拆分消息的历史记录。
             await asyncio.sleep(self.HISTORY_SETTLE_DELAY)
             is_group = bool(event.get_group_id())
             messages, api_message_count = await self._fetch_recent_history_messages(
-                event, session_id, is_group, sent_at, baseline_message_ids
+                event, session_id, is_group, sent_at
             )
-            bot_messages = []
+            bot_candidates = []
             for message in messages:
                 sender_id = str(message.get("sender", {}).get("user_id", ""))
                 message_id = message.get("message_id")
                 if sender_id != bot_self_id or not message_id:
                     continue
                 msg_time = int(message.get("time", 0) or 0)
-                bot_messages.append((msg_time, int(message_id), message))
+                bot_candidates.append((msg_time, int(message_id), message))
+
+            bot_messages = self._match_current_send_history(
+                bot_candidates, expected_segments, response_message_id
+            )
 
             added_count = 0
             # 先补录新消息，保持本地编号列表按时间倒序排列。
@@ -592,6 +642,12 @@ class BatchRecall(Star):
                 ):
                     added_count += 1
 
+            candidate_ids = [
+                message_id
+                for _, message_id, _ in sorted(
+                    bot_candidates, key=lambda item: item[0], reverse=True
+                )
+            ]
             captured_ids = [
                 message_id
                 for _, message_id, _ in sorted(
@@ -601,8 +657,8 @@ class BatchRecall(Star):
             logger.info(
                 f"📥 {'群' if is_group else '私聊'}历史补录完成：API返回 {api_message_count} 条，"
                 f"窗口内 {len(messages)} 条，"
-                f"机器人消息候选 {len(bot_messages)} 条，候选ID {captured_ids[:20]}，"
-                f"发送前基线 {len(baseline_message_ids)} 条，扫描窗口 "
+                f"机器人候选 {len(bot_candidates)} 条，候选ID {candidate_ids[:20]}，"
+                f"匹配本次发送 {len(bot_messages)} 条，ID {captured_ids[:20]}，扫描窗口 "
                 f"{self._get_history_scan_lookback_seconds()} 秒；"
                 f"新增入队 {added_count} 条"
             )
@@ -737,7 +793,6 @@ class BatchRecall(Star):
         pending_no_auto_reserved = False
         session_id = None
         send_started_at = None
-        pre_send_history_ids: Optional[set[int]] = None
         is_command_reply = False
         try:
             if not isinstance(event, AiocqhttpMessageEvent):
@@ -767,10 +822,6 @@ class BatchRecall(Star):
             should_auto_recall = (
                 not is_command_reply and self._should_enable_recall(event)
             )
-            if should_auto_recall:
-                pre_send_history_ids = await self._capture_history_message_ids(
-                    event, session_id, is_group
-                )
             send_started_at = time.time()
             send_started_monotonic = time.monotonic()
             if is_command_reply:
@@ -833,7 +884,8 @@ class BatchRecall(Star):
                         session_id,
                         bot_self_id,
                         send_started_at,
-                        pre_send_history_ids,
+                        onebot_messages,
+                        message_id,
                         scheduled_at=send_started_monotonic,
                     )
                 )
