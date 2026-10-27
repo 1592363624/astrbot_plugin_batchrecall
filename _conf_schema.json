@@ -46,5 +46,11 @@
         "type": "int",
         "hint": "每个会话最多记录多少条机器人消息用于编号撤回",
         "default": 50
+    },
+    "history_scan_lookback_seconds": {
+        "description": "历史消息扫描时间容差",
+        "type": "int",
+        "hint": "扫描发送前的机器人历史消息秒数，用于适应协议端时间戳偏差，范围0到5秒；越大越可能包含此前消息",
+        "default": 2
     }
 }

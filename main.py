@@ -31,6 +31,8 @@ class BatchRecall(Star):
     RETRYABLE_ACTION_RET_CODES = {-1, 1200, 1400}
     HISTORY_PAGE_SIZE = 30
     HISTORY_MAX_PAGES = 3
+    HISTORY_CLOCK_SKEW_TOLERANCE = 2
+    HISTORY_SETTLE_DELAY = 0.3
 
     def __init__(self, context: Context, config):
         super().__init__(context)
@@ -371,7 +373,7 @@ class BatchRecall(Star):
         is_group: bool,
         sent_at: float,
     ) -> list[dict]:
-        """获取本次发送时刻之后的有限页历史，控制每次发送的 API 负载。"""
+        """获取本次发送附近的有限页历史，控制每次发送的 API 负载。"""
         action = "get_group_msg_history" if is_group else "get_friend_msg_history"
         peer_key = "group_id" if is_group else "user_id"
         request = {
@@ -384,8 +386,8 @@ class BatchRecall(Star):
             return []
         messages = [message for message in messages if isinstance(message, dict)]
 
-        # OneBot 时间戳只有秒级精度，因此同一秒内的消息都视为本次发送后的候选。
-        cutoff = int(sent_at)
+        # OneBot 时间戳只有秒级精度，并给协议端与 AstrBot 的时钟留可配置容差。
+        cutoff = int(sent_at) - self._get_history_scan_lookback_seconds()
         seen_ids = {
             int(message["message_id"])
             for message in messages
@@ -455,6 +457,19 @@ class BatchRecall(Star):
             if int(message.get("time", 0) or 0) >= cutoff
         ]
 
+    def _get_history_scan_lookback_seconds(self) -> int:
+        """返回历史扫描容差，并限制配置范围以控制误匹配窗口。"""
+        try:
+            seconds = int(
+                self.conf.get(
+                    "history_scan_lookback_seconds",
+                    self.HISTORY_CLOCK_SKEW_TOLERANCE,
+                )
+            )
+        except (TypeError, ValueError):
+            seconds = self.HISTORY_CLOCK_SKEW_TOLERANCE
+        return max(0, min(seconds, 5))
+
     async def _queue_recent_bot_messages(
         self,
         event: AiocqhttpMessageEvent,
@@ -466,6 +481,8 @@ class BatchRecall(Star):
         """将发送时刻之后的机器人历史消息补录并加入自动撤回队列。"""
         try:
             self._prune_expired_state()
+            # 部分协议端在 send_* 返回后才异步写入拆分消息的历史记录。
+            await asyncio.sleep(self.HISTORY_SETTLE_DELAY)
             is_group = bool(event.get_group_id())
             messages = await self._fetch_recent_history_messages(
                 event, session_id, is_group, sent_at
@@ -518,8 +535,10 @@ class BatchRecall(Star):
                     bot_messages, key=lambda item: item[0], reverse=True
                 )
             ]
-            logger.debug(
-                f"{'群' if is_group else '私聊'}本次发送后机器人消息ID: {captured_ids}；"
+            logger.info(
+                f"📥 {'群' if is_group else '私聊'}历史补录完成：历史记录 {len(messages)} 条，"
+                f"机器人消息候选 {len(bot_messages)} 条，候选ID {captured_ids[:20]}，"
+                f"发送前容差 {self._get_history_scan_lookback_seconds()} 秒；"
                 f"新增入队 {added_count} 条"
             )
         except Exception as exc:
