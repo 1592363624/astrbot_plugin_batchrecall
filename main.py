@@ -605,9 +605,15 @@ class BatchRecall(Star):
                 msg_time = int(message.get("time", 0) or 0)
                 bot_candidates.append((msg_time, int(message_id), message))
 
-            bot_messages = self._match_current_send_history(
-                bot_candidates, expected_segments, response_message_id
+            content_match_enabled = bool(
+                self.conf.get("enable_history_content_match", False)
             )
+            if content_match_enabled:
+                bot_messages = self._match_current_send_history(
+                    bot_candidates, expected_segments, response_message_id
+                )
+            else:
+                bot_messages = bot_candidates
 
             added_count = 0
             # 先补录新消息，保持本地编号列表按时间倒序排列。
@@ -658,7 +664,8 @@ class BatchRecall(Star):
                 f"📥 {'群' if is_group else '私聊'}历史补录完成：API返回 {api_message_count} 条，"
                 f"窗口内 {len(messages)} 条，"
                 f"机器人候选 {len(bot_candidates)} 条，候选ID {candidate_ids[:20]}，"
-                f"匹配本次发送 {len(bot_messages)} 条，ID {captured_ids[:20]}，扫描窗口 "
+                f"{'内容匹配' if content_match_enabled else '时间窗口'}筛选后 "
+                f"{len(bot_messages)} 条，ID {captured_ids[:20]}，扫描窗口 "
                 f"{self._get_history_scan_lookback_seconds()} 秒；"
                 f"新增入队 {added_count} 条"
             )

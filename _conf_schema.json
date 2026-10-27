@@ -50,7 +50,13 @@
     "history_scan_lookback_seconds": {
         "description": "历史消息扫描回看秒数",
         "type": "int",
-        "hint": "历史补录按本次发送内容和媒体类型匹配，扫描窗口范围0到15秒",
+        "hint": "按时间窗口查找机器人历史消息，范围0到15秒",
         "default": 15
+    },
+    "enable_history_content_match": {
+        "description": "历史消息按发送内容匹配",
+        "type": "bool",
+        "hint": "开启后只补录与本次发送文本或媒体类型匹配的机器人消息；关闭时直接使用时间窗口内的机器人消息",
+        "default": false
     }
 }
