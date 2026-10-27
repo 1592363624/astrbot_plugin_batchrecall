@@ -23,6 +23,12 @@
         "hint": "是否在群聊中启用撤回功能",
         "default": true
     },
+    "skip_video_recall": {
+        "description": "撤回跳过视频消息",
+        "type": "bool",
+        "hint": "开启后，自动撤回会跳过包含视频段或视频文件的消息；关闭时视频消息按其他撤回规则处理",
+        "default": false
+    },
     "group_whitelist": {
         "description": "白名单群聊",
         "type": "list",
@@ -46,5 +52,17 @@
         "type": "int",
         "hint": "每个会话最多记录多少条机器人消息用于编号撤回",
         "default": 50
+    },
+    "enable_history_window_recall": {
+        "description": "开启历史窗口撤回",
+        "type": "bool",
+        "hint": "开启后会按历史扫描时间窗口撤回其中的机器人消息，也会撤回其他插件发送的消息，请谨慎开启。关闭后仅撤回发送接口返回的消息ID；拆分或连续发送多条消息时可能只撤回最后一条。",
+        "default": false
+    },
+    "history_scan_lookback_seconds": {
+        "description": "历史消息扫描回看秒数",
+        "type": "int",
+        "hint": "按时间窗口查找机器人历史消息，范围0到15秒",
+        "default": 15
     }
 }
